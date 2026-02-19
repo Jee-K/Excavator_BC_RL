@@ -1,0 +1,74 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual Environments 
+.venv
+
+# Tool cache
+.cache/
+.thumbs/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Test Reports
+rspec.xml
+
+# Type Checking
+.mypy_cache/
+
+# IDEs & Editors
+.vscode
+.history/
+.idea
+
+# Claude Code
+.claude/
+.mcp.json
+
+# Claude Code sandbox artifacts (empty placeholder files created in repo root)
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.gitmodules
+.ripgreprc
+/HEAD
+/config
+/hooks
+/objects
+/refs
+
+# Documentation
+docs/_build/
+docs/api/_generated/
+
+# Airspeed Velocity
+asv/env
+asv/results
+asv/html
+
+# Log files, settings
+MUJOCO_LOG.TXT
+imgui.ini
+newton/tests/outputs/
+
+# Viser recordings
+docs/_static/recordings/
+*.viser
+
+# Viser static files
+docs/_static/viser/
+
+# Notebook checkpoints
+**/*.ipynb_checkpoints/

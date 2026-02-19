@@ -1,0 +1,861 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+import tempfile
+import warnings
+import xml.etree.ElementTree as ET
+from typing import Literal
+from urllib.parse import unquote, urlsplit
+
+import numpy as np
+import warp as wp
+
+from ..core import Axis, AxisType, quat_between_axes
+from ..core.types import Transform
+from ..geometry import Mesh
+from ..sim import ModelBuilder
+from ..sim.joints import ActuatorMode
+from ..sim.model import Model
+from .import_utils import parse_custom_attributes, sanitize_xml_content
+from .mesh import load_meshes_from_file
+from .texture import load_texture
+from .topology import topological_sort
+
+AttributeFrequency = Model.AttributeFrequency
+
+# Optional dependency for robust URI resolution
+try:
+    from resolve_robotics_uri_py import resolve_robotics_uri
+except ImportError:
+    resolve_robotics_uri = None
+
+
+def _download_file(dst, url: str) -> None:
+    import requests
+
+    with requests.get(url, stream=True, timeout=10) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=8192):
+            dst.write(chunk)
+
+
+def download_asset_tmpfile(url: str):
+    """Download a file into a NamedTemporaryFile.
+    A closed NamedTemporaryFile is returned. It must be deleted by the caller."""
+    urlpath = unquote(urlsplit(url).path)
+    file_od = tempfile.NamedTemporaryFile("wb", suffix=os.path.splitext(urlpath)[1], delete=False)
+    _download_file(file_od, url)
+    file_od.close()
+
+    return file_od
+
+
+def parse_urdf(
+    builder: ModelBuilder,
+    source: str,
+    *,
+    xform: Transform | None = None,
+    floating: bool | None = None,
+    base_joint: dict | None = None,
+    parent_body: int = -1,
+    scale: float = 1.0,
+    hide_visuals: bool = False,
+    parse_visuals_as_colliders: bool = False,
+    up_axis: AxisType = Axis.Z,
+    force_show_colliders: bool = False,
+    enable_self_collisions: bool = True,
+    ignore_inertial_definitions: bool = False,
+    ensure_nonstatic_links: bool = True,
+    static_link_mass: float = 1e-2,
+    joint_ordering: Literal["bfs", "dfs"] | None = "dfs",
+    bodies_follow_joint_ordering: bool = True,
+    collapse_fixed_joints: bool = False,
+    mesh_maxhullvert: int | None = None,
+    force_position_velocity_actuation: bool = False,
+):
+    """
+    Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
+
+    Args:
+        builder (ModelBuilder): The :class:`ModelBuilder` to add the bodies and joints to.
+        source (str): The filename of the URDF file to parse, or the URDF XML string content.
+        xform (Transform): The transform to apply to the root body. If None, the transform is set to identity.
+        floating (bool or None): Controls the base joint type for the root body.
+
+            - ``None`` (default): Uses format-specific default (creates a FIXED joint for URDF).
+            - ``True``: Creates a FREE joint with 6 DOF (3 translation + 3 rotation). Only valid when
+              ``parent_body == -1`` since FREE joints must connect to world frame.
+            - ``False``: Creates a FIXED joint (0 DOF).
+
+            Cannot be specified together with ``base_joint``.
+        base_joint (dict): Custom joint specification for connecting the root body to the world
+            (or to ``parent_body`` if specified). This parameter enables hierarchical composition with
+            custom mobility. Dictionary with joint parameters as accepted by
+            :meth:`ModelBuilder.add_joint` (e.g., joint type, axes, limits, stiffness).
+
+            Cannot be specified together with ``floating``.
+        parent_body (int): Parent body index for hierarchical composition. If specified, attaches the
+            imported root body to this existing body, making them part of the same kinematic articulation.
+            The connection type is determined by ``floating`` or ``base_joint``. If ``-1`` (default),
+            the root connects to the world frame. **Restriction**: Only the most recently added
+            articulation can be used as parent; attempting to attach to an older articulation will raise
+            a ``ValueError``.
+
+            .. note::
+               Valid combinations of ``floating``, ``base_joint``, and ``parent_body``:
+
+               .. list-table::
+                  :header-rows: 1
+                  :widths: 15 15 15 55
+
+                  * - floating
+                    - base_joint
+                    - parent_body
+                    - Result
+                  * - ``None``
+                    - ``None``
+                    - ``-1``
+                    - Format default (URDF: FIXED joint)
+                  * - ``True``
+                    - ``None``
+                    - ``-1``
+                    - FREE joint to world (6 DOF)
+                  * - ``False``
+                    - ``None``
+                    - ``-1``
+                    - FIXED joint to world (0 DOF)
+                  * - ``None``
+                    - ``{dict}``
+                    - ``-1``
+                    - Custom joint to world (e.g., D6)
+                  * - ``False``
+                    - ``None``
+                    - ``body_idx``
+                    - FIXED joint to parent body
+                  * - ``None``
+                    - ``{dict}``
+                    - ``body_idx``
+                    - Custom joint to parent body (e.g., D6)
+                  * - *explicitly set*
+                    - *explicitly set*
+                    - *any*
+                    - ❌ Error: mutually exclusive (cannot specify both)
+                  * - ``True``
+                    - ``None``
+                    - ``body_idx``
+                    - ❌ Error: FREE joints require world frame
+
+        scale (float): The scaling factor to apply to the imported mechanism.
+        hide_visuals (bool): If True, hide visual shapes.
+        parse_visuals_as_colliders (bool): If True, the geometry defined under the `<visual>` tags is used for collision handling instead of the `<collision>` geometries.
+        up_axis (AxisType): The up axis of the URDF. This is used to transform the URDF to the builder's up axis. It also determines the up axis of capsules and cylinders in the URDF. The default is Z.
+        force_show_colliders (bool): If True, the collision shapes are always shown, even if there are visual shapes.
+        enable_self_collisions (bool): If True, self-collisions are enabled.
+        ignore_inertial_definitions (bool): If True, the inertial parameters defined in the URDF are ignored and the inertia is calculated from the shape geometry.
+        ensure_nonstatic_links (bool): If True, links with zero mass are given a small mass (see `static_link_mass`) to ensure they are dynamic.
+        static_link_mass (float): The mass to assign to links with zero mass (if `ensure_nonstatic_links` is set to True).
+        joint_ordering (str): The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the URDF. Default is "dfs".
+        bodies_follow_joint_ordering (bool): If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the URDF. Default is True.
+        collapse_fixed_joints (bool): If True, fixed joints are removed and the respective bodies are merged.
+        mesh_maxhullvert (int): Maximum vertices for convex hull approximation of meshes.
+        force_position_velocity_actuation (bool): If True and both position (stiffness) and velocity
+            (damping) gains are non-zero, joints use :attr:`~newton.ActuatorMode.POSITION_VELOCITY` actuation mode.
+            If False (default), actuator modes are inferred per joint via :func:`newton.ActuatorMode.from_gains`:
+            :attr:`~newton.ActuatorMode.POSITION` if stiffness > 0, :attr:`~newton.ActuatorMode.VELOCITY` if only
+            damping > 0, :attr:`~newton.ActuatorMode.EFFORT` if a drive is present but both gains are zero
+            (direct torque control), or :attr:`~newton.ActuatorMode.NONE` if no drive/actuation is applied.
+    """
+    # Early validation of base joint parameters
+    builder._validate_base_joint_params(floating, base_joint, parent_body)
+
+    if mesh_maxhullvert is None:
+        mesh_maxhullvert = Mesh.MAX_HULL_VERTICES
+
+    axis_xform = wp.transform(wp.vec3(0.0), quat_between_axes(up_axis, builder.up_axis))
+    if xform is None:
+        xform = axis_xform
+    else:
+        xform = wp.transform(*xform) * axis_xform
+
+    source = os.fspath(source) if hasattr(source, "__fspath__") else source
+
+    if source.startswith(("package://", "model://")):
+        if resolve_robotics_uri is not None:
+            try:
+                source = resolve_robotics_uri(source)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f'Could not resolve URDF source URI "{source}". '
+                    f"Check that the package is installed and that relevant environment variables "
+                    f"(ROS_PACKAGE_PATH, AMENT_PREFIX_PATH, GZ_SIM_RESOURCE_PATH, etc.) are set correctly. "
+                    f"See https://github.com/ami-iit/resolve-robotics-uri-py for details."
+                ) from None
+        else:
+            raise ImportError(
+                f'Cannot resolve URDF source URI "{source}" without resolve-robotics-uri-py. '
+                f"Install it with: pip install resolve-robotics-uri-py"
+            )
+
+    if os.path.isfile(source):
+        file = ET.parse(source)
+        urdf_root = file.getroot()
+    else:
+        xml_content = sanitize_xml_content(source)
+        urdf_root = ET.fromstring(xml_content)
+
+    # load joint defaults
+    default_joint_limit_lower = builder.default_joint_cfg.limit_lower
+    default_joint_limit_upper = builder.default_joint_cfg.limit_upper
+    default_joint_damping = builder.default_joint_cfg.target_kd
+
+    # load shape defaults
+    default_shape_density = builder.default_shape_cfg.density
+
+    def resolve_urdf_asset(filename: str | None) -> tuple[str | None, tempfile.NamedTemporaryFile | None]:
+        """Resolve a URDF asset URI/path to a local filename.
+
+        Args:
+            filename: Asset filename or URI from the URDF (may be None).
+
+        Returns:
+            A tuple of (resolved_filename, tmpfile). The tmpfile is only
+            populated for temporary downloads (e.g., http/https) and must be
+            cleaned up by the caller (e.g., remove tmpfile.name).
+        """
+        if filename is None:
+            return None, None
+
+        file_tmp = None
+        if filename.startswith(("package://", "model://")):
+            if resolve_robotics_uri is not None:
+                try:
+                    if filename.startswith("package://"):
+                        fn = filename.replace("package://", "")
+                        parent_urdf_folder = os.path.abspath(
+                            os.path.join(os.path.abspath(source), os.pardir, os.pardir, os.pardir)
+                        )
+                        package_dirs = [parent_urdf_folder]
+                    else:
+                        package_dirs = []
+                    filename = resolve_robotics_uri(filename, package_dirs=package_dirs)
+                except FileNotFoundError:
+                    warnings.warn(
+                        f'Warning: could not resolve URI "{filename}". '
+                        f"Check that the package is installed and that relevant environment variables "
+                        f"(ROS_PACKAGE_PATH, AMENT_PREFIX_PATH, GZ_SIM_RESOURCE_PATH, etc.) are set correctly. "
+                        f"See https://github.com/ami-iit/resolve-robotics-uri-py for details.",
+                        stacklevel=2,
+                    )
+                    return None, None
+            else:
+                if not os.path.isfile(source):
+                    warnings.warn(
+                        f'Warning: cannot resolve URI "{filename}" when URDF is loaded from XML string. '
+                        f"Load URDF from a file path, or install resolve-robotics-uri-py: "
+                        f"pip install resolve-robotics-uri-py",
+                        stacklevel=2,
+                    )
+                    return None, None
+                if filename.startswith("package://"):
+                    fn = filename.replace("package://", "")
+                    package_name = fn.split("/")[0]
+                    urdf_folder = os.path.dirname(source)
+                    if package_name in urdf_folder:
+                        filename = os.path.join(urdf_folder[: urdf_folder.rindex(package_name)], fn)
+                    else:
+                        warnings.warn(
+                            f'Warning: could not resolve package "{package_name}" in URI "{filename}". '
+                            f"For robust URI resolution, install resolve-robotics-uri-py: "
+                            f"pip install resolve-robotics-uri-py",
+                            stacklevel=2,
+                        )
+                        return None, None
+                else:
+                    warnings.warn(
+                        f'Warning: cannot resolve model:// URI "{filename}" without resolve-robotics-uri-py. '
+                        f"Install it with: pip install resolve-robotics-uri-py",
+                        stacklevel=2,
+                    )
+                    return None, None
+        elif filename.startswith(("http://", "https://")):
+            file_tmp = download_asset_tmpfile(filename)
+            filename = file_tmp.name
+        else:
+            if not os.path.isabs(filename):
+                if not os.path.isfile(source):
+                    warnings.warn(
+                        f'Warning: cannot resolve relative URI "{filename}" when URDF is loaded from XML string. '
+                        f"Load URDF from a file path.",
+                        stacklevel=2,
+                    )
+                    return None, None
+                filename = os.path.join(os.path.dirname(source), filename)
+
+        if not os.path.exists(filename):
+            warnings.warn(f"Warning: asset file {filename} does not exist", stacklevel=2)
+            return None, None
+
+        return filename, file_tmp
+
+    def _parse_material_properties(material_element):
+        if material_element is None:
+            return None, None
+
+        color = None
+        texture = None
+
+        color_el = material_element.find("color")
+        if color_el is not None:
+            rgba = color_el.get("rgba")
+            if rgba:
+                values = np.fromstring(rgba, sep=" ", dtype=np.float32)
+                if len(values) >= 3:
+                    color = (float(values[0]), float(values[1]), float(values[2]))
+
+        texture_el = material_element.find("texture")
+        if texture_el is not None:
+            texture_name = texture_el.get("filename")
+            if texture_name:
+                resolved, tmpfile = resolve_urdf_asset(texture_name)
+                try:
+                    if resolved is not None:
+                        if tmpfile is not None:
+                            # Temp file will be deleted, so load texture eagerly
+                            texture = load_texture(resolved)
+                        else:
+                            # Local file, pass path for lazy loading by viewer
+                            texture = resolved
+                finally:
+                    if tmpfile is not None:
+                        os.remove(tmpfile.name)
+
+        return color, texture
+
+    materials: dict[str, dict[str, np.ndarray | None]] = {}
+    for material in urdf_root.findall("material"):
+        mat_name = material.get("name")
+        if not mat_name:
+            continue
+        color, texture = _parse_material_properties(material)
+        materials[mat_name] = {
+            "color": color,
+            "texture": texture,
+        }
+
+    def resolve_material(material_element):
+        if material_element is None:
+            return {"color": None, "texture": None}
+        mat_name = material_element.get("name")
+        color, texture = _parse_material_properties(material_element)
+
+        if mat_name and mat_name in materials:
+            resolved = dict(materials[mat_name])
+        else:
+            resolved = {"color": None, "texture": None}
+
+        if color is not None:
+            resolved["color"] = color
+        if texture is not None:
+            resolved["texture"] = texture
+
+        if mat_name and mat_name not in materials and any(value is not None for value in (color, texture)):
+            materials[mat_name] = dict(resolved)
+
+        return resolved
+
+    # Process custom attributes defined for different kinds of shapes, bodies, joints, etc.
+    builder_custom_attr_shape: list[ModelBuilder.CustomAttribute] = builder.get_custom_attributes_by_frequency(
+        [AttributeFrequency.SHAPE]
+    )
+    builder_custom_attr_body: list[ModelBuilder.CustomAttribute] = builder.get_custom_attributes_by_frequency(
+        [AttributeFrequency.BODY]
+    )
+    builder_custom_attr_joint: list[ModelBuilder.CustomAttribute] = builder.get_custom_attributes_by_frequency(
+        [AttributeFrequency.JOINT]
+    )
+    builder_custom_attr_articulation: list[ModelBuilder.CustomAttribute] = builder.get_custom_attributes_by_frequency(
+        [AttributeFrequency.ARTICULATION]
+    )
+
+    def parse_transform(element):
+        if element is None or element.find("origin") is None:
+            return wp.transform()
+        origin = element.find("origin")
+        xyz = origin.get("xyz") or "0 0 0"
+        rpy = origin.get("rpy") or "0 0 0"
+        xyz = [float(x) * scale for x in xyz.split()]
+        rpy = [float(x) for x in rpy.split()]
+        return wp.transform(xyz, wp.quat_rpy(*rpy))
+
+    def parse_shapes(link: int, geoms, density, incoming_xform=None, visible=True, just_visual=False):
+        shape_cfg = builder.default_shape_cfg.copy()
+        shape_cfg.density = density
+        shape_cfg.is_visible = visible
+        shape_cfg.has_shape_collision = not just_visual
+        shape_cfg.has_particle_collision = not just_visual
+        shape_kwargs = {
+            "body": link,
+            "cfg": shape_cfg,
+            "custom_attributes": {},
+        }
+        shapes = []
+        # add geometry
+        for geom_group in geoms:
+            geo = geom_group.find("geometry")
+            if geo is None:
+                continue
+            custom_attributes = parse_custom_attributes(geo.attrib, builder_custom_attr_shape, parsing_mode="urdf")
+            shape_kwargs["custom_attributes"] = custom_attributes
+
+            tf = parse_transform(geom_group)
+            if incoming_xform is not None:
+                tf = incoming_xform * tf
+
+            material_info = {"color": None, "texture": None}
+            if just_visual:
+                material_info = resolve_material(geom_group.find("material"))
+
+            for box in geo.findall("box"):
+                size = box.get("size") or "1 1 1"
+                size = [float(x) for x in size.split()]
+                s = builder.add_shape_box(
+                    xform=tf,
+                    hx=size[0] * 0.5 * scale,
+                    hy=size[1] * 0.5 * scale,
+                    hz=size[2] * 0.5 * scale,
+                    **shape_kwargs,
+                )
+                shapes.append(s)
+
+            for sphere in geo.findall("sphere"):
+                s = builder.add_shape_sphere(
+                    xform=tf,
+                    radius=float(sphere.get("radius") or "1") * scale,
+                    **shape_kwargs,
+                )
+                shapes.append(s)
+
+            for cylinder in geo.findall("cylinder"):
+                # Apply axis rotation to transform
+                xform = wp.transform(tf.p, tf.q * quat_between_axes(Axis.Z, up_axis))
+                s = builder.add_shape_cylinder(
+                    xform=xform,
+                    radius=float(cylinder.get("radius") or "1") * scale,
+                    half_height=float(cylinder.get("length") or "1") * 0.5 * scale,
+                    **shape_kwargs,
+                )
+                shapes.append(s)
+
+            for capsule in geo.findall("capsule"):
+                # Apply axis rotation to transform
+                xform = wp.transform(tf.p, tf.q * quat_between_axes(Axis.Z, up_axis))
+                s = builder.add_shape_capsule(
+                    xform=xform,
+                    radius=float(capsule.get("radius") or "1") * scale,
+                    half_height=float(capsule.get("height") or "1") * 0.5 * scale,
+                    **shape_kwargs,
+                )
+                shapes.append(s)
+
+            for mesh in geo.findall("mesh"):
+                filename = mesh.get("filename")
+                if filename is None:
+                    continue
+                scaling = mesh.get("scale") or "1 1 1"
+                scaling = np.array([float(x) * scale for x in scaling.split()])
+                resolved, file_tmp = resolve_urdf_asset(filename)
+                if resolved is None:
+                    continue
+
+                m_meshes = load_meshes_from_file(
+                    resolved,
+                    scale=scaling,
+                    maxhullvert=mesh_maxhullvert,
+                    override_color=material_info["color"],
+                    override_texture=material_info["texture"],
+                )
+                for m_mesh in m_meshes:
+                    if m_mesh.texture is not None and m_mesh.uvs is None:
+                        warnings.warn(
+                            f"Warning: mesh {resolved} has a texture but no UVs; texture will be ignored.",
+                            stacklevel=2,
+                        )
+                        m_mesh.texture = None
+                    s = builder.add_shape_mesh(
+                        xform=tf,
+                        mesh=m_mesh,
+                        **shape_kwargs,
+                    )
+                    shapes.append(s)
+
+                if file_tmp is not None:
+                    os.remove(file_tmp.name)
+                    file_tmp = None
+
+        return shapes
+
+    joint_indices = []  # Collect joint indices as we create them
+
+    # add joints
+
+    # mapping from parent, child link names to joint
+    parent_child_joint = {}
+
+    joints = []
+    for joint in urdf_root.findall("joint"):
+        parent = joint.find("parent").get("link")
+        child = joint.find("child").get("link")
+        joint_custom_attributes = parse_custom_attributes(joint.attrib, builder_custom_attr_joint, parsing_mode="urdf")
+        joint_data = {
+            "name": joint.get("name"),
+            "parent": parent,
+            "child": child,
+            "type": joint.get("type"),
+            "origin": parse_transform(joint),
+            "damping": default_joint_damping,
+            "friction": 0.0,
+            "axis": wp.vec3(1.0, 0.0, 0.0),
+            "limit_lower": default_joint_limit_lower,
+            "limit_upper": default_joint_limit_upper,
+            "custom_attributes": joint_custom_attributes,
+        }
+        el_axis = joint.find("axis")
+        if el_axis is not None:
+            ax = el_axis.get("xyz", "1 0 0").strip().split()
+            joint_data["axis"] = wp.vec3(float(ax[0]), float(ax[1]), float(ax[2]))
+        el_dynamics = joint.find("dynamics")
+        if el_dynamics is not None:
+            joint_data["damping"] = float(el_dynamics.get("damping", default_joint_damping))
+            joint_data["friction"] = float(el_dynamics.get("friction", 0))
+        el_limit = joint.find("limit")
+        if el_limit is not None:
+            joint_data["limit_lower"] = float(el_limit.get("lower", default_joint_limit_lower))
+            joint_data["limit_upper"] = float(el_limit.get("upper", default_joint_limit_upper))
+        el_mimic = joint.find("mimic")
+        if el_mimic is not None:
+            joint_data["mimic_joint"] = el_mimic.get("joint")
+            joint_data["mimic_coef0"] = float(el_mimic.get("offset", 0))
+            joint_data["mimic_coef1"] = float(el_mimic.get("multiplier", 1))
+
+        parent_child_joint[(parent, child)] = joint_data
+        joints.append(joint_data)
+
+    # topological sorting of joints because the FK function will resolve body transforms
+    # in joint order and needs the parent link transform to be resolved before the child
+    urdf_links = []
+    sorted_joints = []
+    if len(joints) > 0:
+        if joint_ordering is not None:
+            joint_edges = [(joint["parent"], joint["child"]) for joint in joints]
+            sorted_joint_ids = topological_sort(joint_edges, use_dfs=joint_ordering == "dfs")
+            sorted_joints = [joints[i] for i in sorted_joint_ids]
+        else:
+            sorted_joints = joints
+
+        if bodies_follow_joint_ordering:
+            body_order: list[str] = [sorted_joints[0]["parent"]] + [joint["child"] for joint in sorted_joints]
+            for body in body_order:
+                urdf_link = urdf_root.find(f"link[@name='{body}']")
+                if urdf_link is None:
+                    raise ValueError(f"Link {body} not found in URDF")
+                urdf_links.append(urdf_link)
+    if len(urdf_links) == 0:
+        urdf_links = urdf_root.findall("link")
+
+    # add links and shapes
+
+    # maps from link name -> link index
+    link_index: dict[str, int] = {}
+    visual_shapes: list[int] = []
+    start_shape_count = len(builder.shape_type)
+
+    for urdf_link in urdf_links:
+        name = urdf_link.get("name")
+        if name is None:
+            raise ValueError("Link has no name")
+        link = builder.add_link(
+            key=name,
+            custom_attributes=parse_custom_attributes(urdf_link.attrib, builder_custom_attr_body, parsing_mode="urdf"),
+        )
+
+        # add ourselves to the index
+        link_index[name] = link
+
+        visuals = urdf_link.findall("visual")
+        colliders = urdf_link.findall("collision")
+
+        if parse_visuals_as_colliders:
+            colliders = visuals
+        else:
+            s = parse_shapes(link, visuals, density=0.0, just_visual=True, visible=not hide_visuals)
+            visual_shapes.extend(s)
+
+        show_colliders = force_show_colliders
+        if parse_visuals_as_colliders:
+            show_colliders = True
+        elif len(visuals) == 0:
+            # we need to show the collision shapes since there are no visual shapes
+            show_colliders = True
+
+        parse_shapes(link, colliders, density=default_shape_density, visible=show_colliders)
+        m = builder.body_mass[link]
+        el_inertia = urdf_link.find("inertial")
+        if not ignore_inertial_definitions and el_inertia is not None:
+            # overwrite inertial parameters if defined
+            inertial_frame = parse_transform(el_inertia)
+            com = inertial_frame.p
+            builder.body_com[link] = com
+            I_m = np.zeros((3, 3))
+            el_i_m = el_inertia.find("inertia")
+            if el_i_m is not None:
+                I_m[0, 0] = float(el_i_m.get("ixx", 0)) * scale**2
+                I_m[1, 1] = float(el_i_m.get("iyy", 0)) * scale**2
+                I_m[2, 2] = float(el_i_m.get("izz", 0)) * scale**2
+                I_m[0, 1] = float(el_i_m.get("ixy", 0)) * scale**2
+                I_m[0, 2] = float(el_i_m.get("ixz", 0)) * scale**2
+                I_m[1, 2] = float(el_i_m.get("iyz", 0)) * scale**2
+                I_m[1, 0] = I_m[0, 1]
+                I_m[2, 0] = I_m[0, 2]
+                I_m[2, 1] = I_m[1, 2]
+                rot = wp.quat_to_matrix(inertial_frame.q)
+                I_m = rot @ wp.mat33(I_m)
+                builder.body_inertia[link] = I_m
+                if any(x for x in I_m):
+                    builder.body_inv_inertia[link] = wp.inverse(I_m)
+                else:
+                    builder.body_inv_inertia[link] = I_m
+            el_mass = el_inertia.find("mass")
+            if el_mass is not None:
+                m = float(el_mass.get("value", 0))
+                builder.body_mass[link] = m
+                builder.body_inv_mass[link] = 1.0 / m if m > 0.0 else 0.0
+        if m == 0.0 and ensure_nonstatic_links:
+            # set the mass to something nonzero to ensure the body is dynamic
+            m = static_link_mass
+            # cube with side length 0.5
+            I_m = wp.mat33(np.eye(3)) * m / 12.0 * (0.5 * scale) ** 2 * 2.0
+            I_m += wp.mat33(builder.default_body_armature * np.eye(3))
+            builder.body_mass[link] = m
+            builder.body_inv_mass[link] = 1.0 / m
+            builder.body_inertia[link] = I_m
+            builder.body_inv_inertia[link] = wp.inverse(I_m)
+
+    end_shape_count = len(builder.shape_type)
+
+    # add base joint
+    if len(sorted_joints) > 0:
+        base_link_name = sorted_joints[0]["parent"]
+    else:
+        base_link_name = next(iter(link_index.keys()))
+    root = link_index[base_link_name]
+
+    # Determine the parent for the base joint (-1 for world, or an existing body index)
+    base_parent = parent_body
+
+    if base_joint is not None:
+        # in case of a given base joint, the position is applied first, the rotation only
+        # after the base joint itself to not rotate its axis
+        # When parent_body is set, xform is interpreted as relative to the parent body
+        base_parent_xform = wp.transform(xform.p, wp.quat_identity())
+        base_child_xform = wp.transform((0.0, 0.0, 0.0), wp.quat_inverse(xform.q))
+        base_joint_id = builder._add_base_joint(
+            child=root,
+            base_joint=base_joint,
+            key="base_joint",
+            parent_xform=base_parent_xform,
+            child_xform=base_child_xform,
+            parent=base_parent,
+        )
+        joint_indices.append(base_joint_id)
+    elif floating and base_parent == -1:
+        # floating=True only makes sense when connecting to world
+        floating_joint_id = builder._add_base_joint(
+            child=root,
+            floating=True,
+            key="floating_base",
+            parent_xform=xform,
+            parent=base_parent,
+        )
+        joint_indices.append(floating_joint_id)
+
+        # set dofs to transform for the floating base joint
+        start = builder.joint_q_start[floating_joint_id]
+
+        builder.joint_q[start + 0] = xform.p[0]
+        builder.joint_q[start + 1] = xform.p[1]
+        builder.joint_q[start + 2] = xform.p[2]
+
+        builder.joint_q[start + 3] = xform.q[0]
+        builder.joint_q[start + 4] = xform.q[1]
+        builder.joint_q[start + 5] = xform.q[2]
+        builder.joint_q[start + 6] = xform.q[3]
+    else:
+        # Fixed joint to world or to parent_body
+        # When parent_body is set, xform is interpreted as relative to the parent body
+        joint_indices.append(
+            builder._add_base_joint(
+                child=root,
+                floating=False,
+                key="fixed_base",
+                parent_xform=xform,
+                parent=base_parent,
+            )
+        )
+
+    # add joints, in the desired order starting from root body
+    # Track only joints that are actually created (some may be skipped if their child body wasn't inserted).
+    joint_name_to_idx: dict[str, int] = {}
+    for joint in sorted_joints:
+        parent = link_index[joint["parent"]]
+        child = link_index[joint["child"]]
+        if child == -1:
+            # we skipped the insertion of the child body
+            continue
+
+        lower = joint.get("limit_lower", None)
+        upper = joint.get("limit_upper", None)
+        joint_damping = joint["damping"]
+
+        parent_xform = joint["origin"]
+
+        joint_params = {
+            "parent": parent,
+            "child": child,
+            "parent_xform": parent_xform,
+            "key": joint["name"],
+            "custom_attributes": joint["custom_attributes"],
+        }
+
+        # URDF doesn't contain gain information (only damping, no stiffness), so we can't infer
+        # actuator mode. Default to POSITION.
+        actuator_mode = ActuatorMode.POSITION_VELOCITY if force_position_velocity_actuation else ActuatorMode.POSITION
+
+        created_joint_idx: int
+        if joint["type"] == "revolute" or joint["type"] == "continuous":
+            created_joint_idx = builder.add_joint_revolute(
+                axis=joint["axis"],
+                target_kd=joint_damping,
+                actuator_mode=actuator_mode,
+                limit_lower=lower,
+                limit_upper=upper,
+                **joint_params,
+            )
+        elif joint["type"] == "prismatic":
+            created_joint_idx = builder.add_joint_prismatic(
+                axis=joint["axis"],
+                target_kd=joint_damping,
+                actuator_mode=actuator_mode,
+                limit_lower=lower * scale,
+                limit_upper=upper * scale,
+                **joint_params,
+            )
+        elif joint["type"] == "fixed":
+            created_joint_idx = builder.add_joint_fixed(**joint_params)
+        elif joint["type"] == "floating":
+            created_joint_idx = builder.add_joint_free(**joint_params)
+        elif joint["type"] == "planar":
+            # find plane vectors perpendicular to axis
+            axis = np.array(joint["axis"])
+            axis /= np.linalg.norm(axis)
+
+            # create helper vector that is not parallel to the axis
+            helper = np.array([1, 0, 0]) if np.allclose(axis, [0, 1, 0]) else np.array([0, 1, 0])
+
+            u = np.cross(helper, axis)
+            u /= np.linalg.norm(u)
+
+            v = np.cross(axis, u)
+            v /= np.linalg.norm(v)
+
+            created_joint_idx = builder.add_joint_d6(
+                linear_axes=[
+                    ModelBuilder.JointDofConfig(
+                        u,
+                        limit_lower=lower * scale,
+                        limit_upper=upper * scale,
+                        target_kd=joint_damping,
+                        actuator_mode=actuator_mode,
+                    ),
+                    ModelBuilder.JointDofConfig(
+                        v,
+                        limit_lower=lower * scale,
+                        limit_upper=upper * scale,
+                        target_kd=joint_damping,
+                        actuator_mode=actuator_mode,
+                    ),
+                ],
+                **joint_params,
+            )
+        else:
+            raise Exception("Unsupported joint type: " + joint["type"])
+
+        joint_indices.append(created_joint_idx)
+        joint_name_to_idx[joint["name"]] = created_joint_idx
+
+    # Create mimic constraints
+    for joint in sorted_joints:
+        if "mimic_joint" in joint:
+            mimic_target_name = joint["mimic_joint"]
+            if mimic_target_name not in joint_name_to_idx:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' references unknown joint '{mimic_target_name}', skipping mimic constraint",
+                    stacklevel=2,
+                )
+                continue
+
+            follower_idx = joint_name_to_idx.get(joint["name"])
+            leader_idx = joint_name_to_idx.get(mimic_target_name)
+
+            if follower_idx is None:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' was not created, skipping mimic constraint",
+                    stacklevel=2,
+                )
+                continue
+
+            builder.add_constraint_mimic(
+                joint0=follower_idx,
+                joint1=leader_idx,
+                coef0=joint.get("mimic_coef0", 0.0),
+                coef1=joint.get("mimic_coef1", 1.0),
+                key=f"mimic_{joint['name']}",
+            )
+
+    # Create articulation from all collected joints
+    articulation_key = urdf_root.attrib.get("name")
+    articulation_custom_attrs = parse_custom_attributes(
+        urdf_root.attrib, builder_custom_attr_articulation, parsing_mode="urdf"
+    )
+    builder._finalize_imported_articulation(
+        joint_indices=joint_indices,
+        parent_body=parent_body,
+        articulation_key=articulation_key,
+        custom_attributes=articulation_custom_attrs,
+    )
+
+    for i in range(start_shape_count, end_shape_count):
+        for j in visual_shapes:
+            builder.add_shape_collision_filter_pair(i, j)
+
+    if not enable_self_collisions:
+        for i in range(start_shape_count, end_shape_count):
+            for j in range(i + 1, end_shape_count):
+                builder.add_shape_collision_filter_pair(i, j)
+
+    if collapse_fixed_joints:
+        builder.collapse_fixed_joints()
