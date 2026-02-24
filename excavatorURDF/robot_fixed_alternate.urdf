@@ -92,7 +92,7 @@
 </inertial>
 </link>
 
-<joint name="left_sprocket_wheel" type="continuous">
+<joint name="left_sprocket_wheel" type="fixed">
 <origin xyz="-0.5739999999999999547 -0.80000000000000015543 -0.2750000000000000222" rpy="1.570796326794896558 -0.3547477759675310427 1.5707963267948976682" />
 <parent link="compact_excavator_frame_body" />
 <child link="compact_excavator_main_drive_wheel_cmpl_(1)" />
@@ -124,7 +124,7 @@
 </inertial>
 </link>
 
-<joint name="right_sprocket_wheel" type="continuous">
+<joint name="right_sprocket_wheel" type="fixed">
 <origin xyz="0.5739999999999999547 -0.80000000000000004441 -0.2750000000000000222" rpy="1.570796326794896558 -1.2984776443375001254 -1.5707963267948972241" />
 <parent link="compact_excavator_frame_body" />
 <child link="compact_excavator_main_drive_wheel_cmpl" />
@@ -156,7 +156,7 @@
 </inertial>
 </link>
 
-<joint name="left_idle_passive_wheel" type="continuous">
+<joint name="left_idle_passive_wheel" type="fixed">
 <origin xyz="-0.61299999999999998934 0.80000000000000026645 -0.2750000000000000222" rpy="1.570796326794896558 -1.0222876983448163646 -1.5707963267948941155" />
 <parent link="compact_excavator_frame_body" />
 <child link="compact_excavator_front_wheel" />
@@ -188,7 +188,7 @@
 </inertial>
 </link>
 
-<joint name="right_idle_passive_wheel" type="continuous">
+<joint name="right_idle_passive_wheel" type="fixed">
 <origin xyz="0.54800000000000004263 0.80000000000000015543 -0.27499999999999996669" rpy="1.57079632679489678 -1.1102232252180887662e-16 -1.5707963267948976682" />
 <parent link="compact_excavator_frame_body" />
 <child link="compact_excavator_front_wheel_2" />
@@ -222,7 +222,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_1" type="continuous">
+<joint name="roll_wheel_1" type="fixed">
 <origin xyz="0.66300000000000003375 -0.4500000000000000111 -0.3850000000000001199" rpy="1.5707963267948972241 -0.13040282330050728676 1.5707963267948934494" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1" />
@@ -254,7 +254,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_2" type="continuous">
+<joint name="roll_wheel_2" type="fixed">
 <origin xyz="0.66300000000000003375 1.6208704515421723024e-16 -0.38499999999999995337" rpy="1.570796326794896558 0.29254554115964298555 1.5707963267948799047" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1_2" />
@@ -286,7 +286,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_3" type="continuous">
+<joint name="roll_wheel_3" type="fixed">
 <origin xyz="0.66299999999999992273 0.45000000000000023315 -0.38499999999999995337" rpy="1.570796326794896558 7.7715625765379412706e-16 1.5707963267948807928" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1_3" />
@@ -318,7 +318,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_4" type="continuous">
+<joint name="roll_wheel_4" type="fixed">
 <origin xyz="-0.66299999999999992273 -0.44999999999999995559 -0.38500000000000000888" rpy="-1.570796326794896558 7.7715625765379412706e-16 1.5707963267948807928" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1_4" />
@@ -350,7 +350,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_5" type="continuous">
+<joint name="roll_wheel_5" type="fixed">
 <origin xyz="-0.66300000000000003375 1.4276916718361678559e-16 -0.38500000000000000888" rpy="-1.570796326794896558 7.7715625765379412706e-16 1.5707963267948807928" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1_5" />
@@ -382,7 +382,7 @@
 </inertial>
 </link>
 
-<joint name="roll_wheel_6" type="continuous">
+<joint name="roll_wheel_6" type="fixed">
 <origin xyz="-0.66300000000000014477 0.45000000000000028866 -0.38499999999999995337" rpy="1.570796326794896558 0.67460937465725012707 -1.5707963267948736874" />
 <parent link="compact_excavator_frame_body" />
 <child link="track_roller_wheel_1_6" />
@@ -414,7 +414,7 @@
 </inertial>
 </link>
 
-<joint name="idler1_wheel" type="continuous">
+<joint name="idler1_wheel" type="fixed">
 <origin xyz="0.48399999999999998579 9.8890270385806678237e-17 -0.13000000000000047629" rpy="1.570796326794896336 0.082813481944898445497 -1.5707963267948976682" />
 <parent link="compact_excavator_frame_body" />
 <child link="carrier_roller" />
@@ -446,7 +446,7 @@
 </inertial>
 </link>
 
-<joint name="idler2_wheel" type="continuous">
+<joint name="idler2_wheel" type="fixed">
 <origin xyz="-0.48400000000000009681 8.7258015952359919992e-17 -0.1299999999999995326" rpy="1.5707963267948950037 -1.1102232252196901538e-16 1.5707963267948976682" />
 <parent link="compact_excavator_frame_body" />
 <child link="carrier_roller_2" />
@@ -610,7 +610,7 @@
 <parent link="part02_cmpl" />
 <child link="part03" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" />
+<limit effort="1" velocity="20" lower="-0.9" upper="0.3"/>
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -619,7 +619,7 @@
 <parent link="part01_pin_1" />
 <child link="part02_cmpl" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" />
+<limit effort="1" velocity="20" lower="-0.4" upper="1.0"/>
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -628,7 +628,7 @@
 <parent link="compact_excavator_cabin_body_cmpl" />
 <child link="part01_pin_1" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" />
+<limit effort="1" velocity="20" lower="-0.1" upper="0.8"/>
 <joint_properties friction="0.0"/>
 </joint>
 
