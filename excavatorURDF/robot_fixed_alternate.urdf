@@ -460,7 +460,7 @@
 <parent link="compact_excavator_turret_cabin_roller" />
 <child link="compact_excavator_frame_body" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" />
+<limit effort="1" velocity="5" />
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -610,7 +610,7 @@
 <parent link="part02_cmpl" />
 <child link="part03" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" lower="-0.9" upper="0.3"/>
+<limit effort="5" velocity="20" lower="-0.9" upper="0.3"/>
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -619,7 +619,7 @@
 <parent link="part01_pin_1" />
 <child link="part02_cmpl" />
 <axis xyz="0 0 1"/>
-<limit effort="1" velocity="20" lower="-0.4" upper="1.0"/>
+<limit effort="12" velocity="20" lower="-0.4" upper="1.0"/>
 <joint_properties friction="0.0"/>
 </joint>
 

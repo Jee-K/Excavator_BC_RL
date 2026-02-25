@@ -51,7 +51,7 @@ class ExcavatorMPMExample:
         # Use relative path from this script's directory
 
         # Load excavator URDF
-        excavator_urdf = "/home/caee/Desktop/urdf_integration/RL/excavatorURDF/robot_fixed_cleaned.urdf"
+        excavator_urdf = "./excavatorURDF/robot_fixed_alternate.urdf"
         print(f"Loading excavator from: {excavator_urdf}")
         
         # Position excavator at the side of soil pile so it can reach in
@@ -63,8 +63,8 @@ class ExcavatorMPMExample:
                 wp.vec3(0.0, 3.0, 0.5),  # Side of soil pile, at edge
                 wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.0)  # Facing soil
             ),
-            floating=False,  # Excavator is grounded
-            enable_self_collisions=False,
+            floating=True,  # Excavator is not grounded # !!! this to avoid having to change the model rooting weirdly
+            enable_self_collisions=False, # unfortunately too unstable, we'll have to manage this through good bounds
             collapse_fixed_joints=True,
             ignore_inertial_definitions=False,
         )
@@ -107,8 +107,12 @@ class ExcavatorMPMExample:
         joint_lower = self.model.joint_limit_lower.numpy() if hasattr(self.model, 'joint_limit_lower') else None
         joint_upper = self.model.joint_limit_upper.numpy() if hasattr(self.model, 'joint_limit_upper') else None
 
+        print(joint_types, joint_lower, joint_upper)
+
         joint_names = []
+        # TODO: fix all this
         for i in range(self.model.joint_count):
+            # works for this setup, at least
             name = self.model.joint_name[i] if hasattr(self.model, 'joint_name') else f"joint_{i}"
             joint_names.append(name)
 
@@ -123,7 +127,7 @@ class ExcavatorMPMExample:
         mpm_options = SolverImplicitMPM.Options()
         mpm_options.voxel_size = voxel_size
         mpm_options.tolerance = 1.0e-5
-        mpm_options.transfer_scheme = "pic"
+        mpm_options.transfer_scheme = "pic" # apic ???
         mpm_options.grid_type = "sparse"  # "sparse" or "fixed"
         mpm_options.strain_basis = "P0"
         mpm_options.max_iterations = 50
@@ -153,6 +157,7 @@ class ExcavatorMPMExample:
 
         # Control setup
         self.control = self.model.control()
+        self._joint_target_host = self.control.joint_target_pos.numpy()
 
         print(f"\nControl gains (set per joint on builder):")
         print(f"  joint_target_ke: 5000.0")
@@ -253,64 +258,55 @@ class ExcavatorMPMExample:
             (positions[:, 1] >= y_min) & (positions[:, 1] <= y_max) &
             (positions[:, 2] >= z_min) & (positions[:, 2] <= z_max)
         )
-        return int(np.sum(inside))
+        return int(np.count_nonzero(inside))
 
     def create_mpm_soil(self, builder, voxel_size, particles_per_cell):
-        """Create MPM soil particles"""
-        # Soil region parameters
-        soil_width = 4.0   # 4m wide
-        soil_length = 4.0  # 4m long
-        soil_height = 0.8  # 80cm deep
+        soil_width = 4.0
+        soil_length = 4.0
+        soil_height = 0.8
 
-        # Calculate number of particles
-        volume = soil_width * soil_length * soil_height
-        voxel_volume = voxel_size ** 3
-        num_voxels = int(volume / voxel_volume)
-        num_particles = num_voxels * particles_per_cell
+        nx = int(round(soil_width / voxel_size))
+        ny = int(round(soil_length / voxel_size))
+        nz = int(round(soil_height / voxel_size))
 
-        print(f"Creating {num_particles:,} soil particles...")
-        print(f"  Soil dimensions: {soil_width}m x {soil_length}m x {soil_height}m")
-        print(f"  Voxel size: {voxel_size}m")
-        print(f"  Particles per voxel: {particles_per_cell}")
+        density = 1800.0
+        particle_mass = density * (voxel_size ** 3) / particles_per_cell
 
-        # Generate particle positions
-        positions = []
-        for i in range(num_particles):
-            # Random position within soil volume
-            x = np.random.uniform(-soil_width/2, soil_width/2)
-            y = np.random.uniform(-soil_length/2, soil_length/2)
-            z = np.random.uniform(0.05, soil_height)  # Slight offset from ground
-            positions.append([x, y, z])
+        # Build voxel origins in a vectorized way
+        xs = -soil_width / 2 + np.arange(nx, dtype=np.float32) * voxel_size
+        ys = -soil_length / 2 + np.arange(ny, dtype=np.float32) * voxel_size
+        zs = 0.05 + np.arange(nz, dtype=np.float32) * voxel_size
 
-        positions = np.array(positions, dtype=np.float32)
+        grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+        n_cells = grid.shape[0]
 
-        # Soil material properties (wet, cohesive soil)
-        youngs_modulus = 20.0e6    # Pa (soft soil)
-        poissons_ratio = 0.4     # Typical for soil
-        density = 1800.0          # kg/m³ (wet soil)
-        friction_angle = 40.0     # degrees (internal friction)
-        cohesion = 50000.0         # Pa (wet soil cohesion)
+        # Vectorized jitter for all particles
+        rng = np.random.default_rng(42)
+        jitter = rng.random((n_cells, particles_per_cell, 3), dtype=np.float32) * voxel_size
+        positions = (grid[:, None, :] + jitter).reshape(-1, 3)
 
-        # Add particles to model
-        for i, pos in enumerate(positions):
+        zero_vel = wp.vec3(0.0, 0.0, 0.0)
+        for p in positions:
             builder.add_particle(
-                pos=wp.vec3(pos[0], pos[1], pos[2]),
-                vel=wp.vec3(0.0, 0.0, 0.0),
-                mass=density * (voxel_size ** 3) / particles_per_cell
+                pos=wp.vec3(float(p[0]), float(p[1]), float(p[2])),
+                vel=zero_vel,
+                mass=particle_mass,
             )
 
-        # Set MPM material properties
-        builder.mpm_E = youngs_modulus
-        builder.mpm_nu = poissons_ratio
-        builder.mpm_mu = np.tan(np.radians(friction_angle))
-        builder.mpm_lambda = cohesion
+        # Elastic material
+        E = 20e6
+        nu = 0.4
+        builder.mpm_E = E
+        builder.mpm_nu = nu
+        builder.mpm_mu = E / (2 * (1 + nu))
+        builder.mpm_lambda = E * nu / ((1 + nu) * (1 - 2 * nu))
 
         print(f"Soil properties:")
-        print(f"  Young's modulus: {youngs_modulus/1e6:.1f} MPa")
-        print(f"  Poisson's ratio: {poissons_ratio}")
+        # print(f"  Young's modulus: {youngs_modulus/1e6:.1f} MPa")
+        # print(f"  Poisson's ratio: {poissons_ratio}")
         print(f"  Density: {density} kg/m³")
-        print(f"  Friction angle: {friction_angle}°")
-        print(f"  Cohesion: {cohesion/1000:.1f} kPa")
+        # print(f"  Friction angle: {friction_angle}°")
+        # print(f"  Cohesion: {cohesion/1000:.1f} kPa")
 
     def capture(self):
         """Capture CUDA graphs for performance"""
@@ -339,6 +335,7 @@ class ExcavatorMPMExample:
 
     def simulate_sand(self):
         """Simulate MPM sand physics"""
+        # TODO add gravity
         for _ in range(self.sim_substeps):
             self.mpm_solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
             self.mpm_solver.project_outside(self.state_1, self.state_1, self.sim_dt)
@@ -350,26 +347,64 @@ class ExcavatorMPMExample:
         Modify this function to control the excavator.
         Sets target positions for joint position control.
         """
+        current_pos = self.state_0.joint_q.numpy()
+        pos = self._joint_target_host
+
+        if pos.shape[0] < 4:
+            return
+
         t = self.sim_time
+        # I'm noticing a lack of self-collision
+        # in robot_fixed_cleaned:
+        # 0 - base rotation! except it seems the track portions spin and the rest stays still
+        # 1 - back left track gear 
+        # 2 - back right track gear
+        # 3 - front left track wheel
+        # 4 - front right track wheel
+        # 5-12 - bottom track portions and left-right bar portions, not clear which
+        # 13 - front left-right rotator, right then left
+        # 14 - back arm, down then up
+        # 15 - middle arm, outwards then inwards
+        # 16 - bucket, tight then open. this one has collision since the visual is purely aesthetic, the collision one is still the simple boxy form
+        
+        # in robot_fixed_alternate
+        # grounded versions, +1 for float:
+        # 0 - base, left then right
+        # 1 - front left-right rotator, right then left
+        # 2 - back arm, down then up # you really have to exceed the real limit to achieve this, something like -3.5 is necessary to get a hover
+        # 3 - middle arm, outwards then inwards # 0.8 usually hovers at full extension
+        # 4 - bucket, tight then open
+        # 1 in -.1, .8
+        # 2 in -.4, 1
+        # 3 in -.9, .3
 
-        # Sinusoidal joint motions for demonstration
-        if self.model.joint_count >= 4:
-            positions = self.control.joint_target_pos.numpy()
-            current_pos = self.state_0.joint_q.numpy()
+        # in robot_fixed_alternate and ungrounded
+        # 0 - x
+        # 1 - y
+        # 2 - z
+        # 3-6 - quaternion related partwise-rotation nonsense
+        # 7 - base
+        # 8 - front-left rotator
+        # 9 - back arm
+        # 10 - middle arm
+        # 11 - bucket
 
-            # Slow, gentle motions to see excavator interact with soil
-            positions[0] = 0.15 * np.sin(t * 0.4)   # Body rotation (swing)
-            positions[1] = 0.25 * np.sin(t * 0.25)  # Upper boom (up/down)
-            positions[2] = 0.3 * np.sin(t * 0.3)    # Lower boom (extend/retract)
-            positions[3] = 0.2 * np.sin(t * 0.35)   # Bucket (curl/dump)
+        # pos[2] = .5
+        pos[9] = 1000
+        pos[8] = 1000
+        # pos[6] = t
+        # pos[6] = 10 * np.sin(t / 2)
 
-            self.control.joint_target_pos.assign(positions)
+        self.control.joint_target_pos.assign(pos)
 
-            # Debug output every 2 seconds
-            if int(t) % 2 == 0 and t - int(t) < self.frame_dt:
-                print(f"\n[t={t:.1f}s] Control Debug:")
-                print(f"  Target pos [0-3]: [{positions[0]:.3f}, {positions[1]:.3f}, {positions[2]:.3f}, {positions[3]:.3f}]")
-                print(f"  Current pos [0-3]: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}, {current_pos[3]:.3f}]")
+        # Debug output every 2 seconds
+        if int(t) % 2 == 0 and t - int(t) < self.frame_dt:
+            
+            print(pos, current_pos)
+            print(f"\n[t={t:.1f}s] Control Debug:")
+            
+            print(f"  Target pos:          [{', '.join([format(float(x), '6.3f') for x in pos])}]")
+            print(f"  Current pos: [{', '.join([format(float(x), '6.3f') for x in current_pos])}]")
 
     def step(self):
         """Step the simulation forward"""
@@ -411,8 +446,8 @@ def main():
     viewer, args = newton.examples.init()
 
     # Use default MPM parameters
-    voxel_size = 0.05
-    particles_per_cell = 3
+    voxel_size = 1 # .05
+    particles_per_cell = 1 # 3
 
     # Create simulation
     example = ExcavatorMPMExample(
