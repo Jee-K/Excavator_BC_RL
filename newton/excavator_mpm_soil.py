@@ -56,24 +56,29 @@ class ExcavatorMPMExample:
         
         # Position excavator at the side of soil pile so it can reach in
         # Soil is centered at origin, 4m x 4m, so excavator at x=-3.0 is at the edge
-        articulation_start = builder.joint_count
+        # Set position control gains for each excavator joint (like ANYmal example)
+        # Using much higher gains for heavy excavator
+        # Correctly determine control slot range for gains (skip root DOFs)
+        control_start = len(builder.joint_target_ke)
+        # After add_urdf, record control end
         builder.add_urdf(
             excavator_urdf,
-            xform=wp.transform(
-                wp.vec3(0.0, 3.0, 0.5),  # Side of soil pile, at edge
-                wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.0)  # Facing soil
-            ),
-            floating=True,  # Excavator is not grounded # !!! this to avoid having to change the model rooting weirdly
-            enable_self_collisions=False, # unfortunately too unstable, we'll have to manage this through good bounds
+            xform=wp.transform(wp.vec3(0.0, 3.0, 0.5), wp.quat_identity()),
+            floating=True,
+            enable_self_collisions=False,
             collapse_fixed_joints=True,
             ignore_inertial_definitions=False,
         )
+        control_end = len(builder.joint_target_ke)
+        print(f"[INFO] Control range for excavator: {control_start} → {control_end}")
 
-        # Set position control gains for each excavator joint (like ANYmal example)
-        # Using much higher gains for heavy excavator
-        for i in range(articulation_start, builder.joint_count):
-            builder.joint_target_ke[i] = 5000.0  # Position control stiffness (10x higher for excavator)
-            builder.joint_target_kd[i] = 500.0   # Position control damping
+        # Apply gains only to actual control slots (not floating base)
+        # these values intended to be quite high
+        for i in range(control_start, control_end):
+            # the boom base seems to need pretty high ???
+            builder.joint_target_ke[i] = 5000.0 # we could choose to make these *extremely* high and rely on urdf values
+            builder.joint_target_kd[i] = 500.0
+        builder.joint_target_ke[8] = 12000.0 # artificially increase boom gain, since it seems to be struggling
 
         # Create MPM soil terrain
         print("Creating MPM soil terrain...")
@@ -384,14 +389,25 @@ class ExcavatorMPMExample:
         # 2 - z
         # 3-6 - quaternion related partwise-rotation nonsense
         # 7 - base
-        # 8 - front-left rotator
+        # 8 - front l/r rotator
         # 9 - back arm
         # 10 - middle arm
         # 11 - bucket
 
+        # new scheme of loading joints for alt ungrounded
+        # 6 - base rotator?
+        # 7 - front left-right rotator
+        # 8 - back arm
+        # 9 - middle arm
+        # 10 - bucket
+
         # pos[2] = .5
-        pos[9] = 1000
-        pos[8] = 1000
+        pos[6] = 0
+        pos[7] = 0
+        pos[8] = -.5-np.sin(t / 5)
+        pos[9] = np.sin(t / 3)
+        pos[10] = np.sin(t / 2)
+        # pos[10] = 10
         # pos[6] = t
         # pos[6] = 10 * np.sin(t / 2)
 
