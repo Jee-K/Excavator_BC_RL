@@ -460,7 +460,8 @@
 <parent link="compact_excavator_turret_cabin_roller" />
 <child link="compact_excavator_frame_body" />
 <axis xyz="0 0 1"/>
-<limit effort="20000" velocity="1" />
+<limit effort="20000" velocity="1.1" />
+<!-- <limit effort="20000" velocity="0.3" /> -->
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -593,12 +594,12 @@
 <!-- left_wall -->
 <collision>
 <origin xyz="0.2408 0.6114 -0.1950" rpy="0 0 3.0159" />
-<geometry><box size="0.550 0.750 0.140" /></geometry>
+<geometry><box size="0.550 0.750 0.200" /></geometry>
 </collision>
 <!-- right_wall -->
 <collision>
 <origin xyz="0.2408 0.6114 0.3050" rpy="0 0 3.0159" />
-<geometry><box size="0.550 0.750 0.140" /></geometry>
+<geometry><box size="0.550 0.750 0.200" /></geometry>
 </collision>
 <visual>
 <origin xyz="0.17000000000000259348 0.30800000000000071765 0.054999999999999271694" rpy="-3.1415926535897793492 -1.5707963267948956698 0" />
@@ -628,7 +629,7 @@
 <parent link="part03" />
 <child link="part04" />
 <axis xyz="0 0 1"/>
-<limit effort="10000" velocity="3" lower="-1.2217304763960306069" upper="0.87266462599716476678"/>
+<limit effort="10000" velocity="0.7" lower="-1.2217304763960306069" upper="0.87266462599716476678"/>
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -637,7 +638,7 @@
 <parent link="part02_cmpl" />
 <child link="part03" />
 <axis xyz="0 0 1"/>
-<limit effort="20000" velocity="1.5" lower="-0.9" upper="0.3"/>
+<limit effort="20000" velocity=".45" lower="-0.9" upper="0.3"/>
 <joint_properties friction="0.0"/>
 </joint>
 
@@ -646,16 +647,15 @@
 <parent link="part01_pin_1" />
 <child link="part02_cmpl" />
 <axis xyz="0 0 1"/>
-<limit effort="40000" velocity=".8" lower="-0.45" upper="1.0"/>
+<limit effort="40000" velocity=".45" lower="-0.45" upper="1.0"/>
 <joint_properties friction="0.0"/>
 </joint>
 
-<joint name="full_arm_rotation" type="revolute">
-<origin xyz="-0.040707723917193440466 -0.80673603465099630316 0.38039999999999996039" rpy="3.141592653589793116 1.3405772267554363358e-16 0.49184482936957452104" />
+<joint name="full_arm_rotation" type="fixed">
+<origin xyz="-0.040707723917193440466 -0.80673603465099630316 0.38039999999999996039" rpy="3.141592653589793116 1.3405772267554363358e-16 0" />
 <parent link="compact_excavator_cabin_body_cmpl" />
 <child link="part01_pin_1" />
 <axis xyz="0 0 1"/>
-<limit effort="10000" velocity="1" lower="-0.1" upper="0.8"/>
 <joint_properties friction="0.0"/>
 </joint>
 
