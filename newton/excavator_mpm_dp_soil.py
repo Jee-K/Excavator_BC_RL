@@ -1,31 +1,17 @@
 #!/usr/bin/env python3
 """
 Excavator + MPM soil simulation tuned for a practical RL / sim-to-real compromise.
-
-What changed versus the uploaded rework:
-- keep the leak fix: synchronized collider pose + interleaved rigid/soil stepping
-- keep the thicker bucket MPM proxy to reduce soil tunneling through the scoop
-- add simulation presets (fast_rl / balanced / accuracy)
-- add contact-aware MPM substepping so the solver spends effort near the dig face
-  and backs off when the tool is away from soil
-- keep the demo controller path isolated; the main changes are in soil/contact logic
-
-Important limitation:
-This stays within the Newton/Warp implicit MPM interface exposed in the uploaded
-scripts. The example below adds a Drucker-Prager-inspired post-step plasticity
-regularizer around the existing solver. It is intentionally smooth and RL-friendly,
-but it is not a full internal return-mapping implementation inside Newton's MPM core.
 """
-
-import math
-import os
+# these aren't necessary, but they make it easier to read
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+# necessaries
 import numpy as np
-import warp as wp
 
+# main simulation tools
+import warp as wp
 import newton
 import newton.examples
 from newton.solvers import SolverImplicitMPM
@@ -33,6 +19,7 @@ from newton.solvers import SolverImplicitMPM
 
 @dataclass(frozen=True)
 class SoilPreset:
+    # material information
     name: str = "moist_sandy_loam"
     density_kg_m3: float = 1650.0
     youngs_modulus_pa: float = 8.0e6
@@ -42,6 +29,7 @@ class SoilPreset:
     dilatancy_deg: float = 3.0
     interface_friction_mu: float = 0.55
 
+    # spawn information
     slope_angle_deg: float = 32.0
     bank_height_m: float = 0.85
     bank_width_m: float = 2.6
@@ -51,11 +39,18 @@ class SoilPreset:
 
 @dataclass(frozen=True)
 class EnvironmentPreset:
-    excavator_position: tuple[float, float, float] = (0.0, 3.0, 0.35)
+    # excavator information, rotation largely excluded
+    excavator_position: tuple[float, float, float] = (0.0, 3.0, 0.6)
+
+    # this looks slightly better than the built-in ground in the rendered, even though they act the same
     ground_size: tuple[float, float] = (20.0, 20.0)
+
+    # goal information
     bucket_center: tuple[float, float, float] = (-4.0, 3.0, 0.0)
     bucket_inner_half: tuple[float, float, float] = (0.75, 1.5, 0.8)
     bucket_wall_thickness: float = 0.1
+
+    # spawn information !!!
     bank_front_y: float = 1.10
     bank_back_y: float = -1.10
 
@@ -63,7 +58,6 @@ class EnvironmentPreset:
 @dataclass(frozen=True)
 class DigPose:
     swing: float
-    boom: float
     arm: float
     stick: float
     bucket: float
@@ -102,7 +96,6 @@ SIM_PRESETS: dict[str, SimulationPreset] = {
 @dataclass(frozen=True)
 class DPRegularizerConfig:
     enabled: bool = True
-    matching: str = "inscribed_from_mohr_coulomb"
     active_margin_m: float = 0.35
     bucket_margin_m: float = 0.25
     flow_length_m: float = 0.06
@@ -154,7 +147,7 @@ def drucker_prager_velocity_regularizer(
     bucket_half_extent: wp.vec3,
     bucket_margin: float,
     bucket_bonus: float,
-):
+): # !!!
     """Smooth Drucker-Prager-inspired velocity regularization.
 
     This is an external post-step correction, not a native constitutive update.
@@ -612,11 +605,11 @@ class ExcavatorMPMExample:
         y_back = self.env.bank_back_y
         max_height = self.soil.bank_height_m
         z0 = self.soil.spawn_clearance_m
-        slope_tan = math.tan(math.radians(self.soil.slope_angle_deg))
+        slope_tan = np.tan(np.radians(self.soil.slope_angle_deg))
 
-        nx = int(math.ceil(self.soil.bank_width_m / self.voxel_size))
-        ny = int(math.ceil(self.soil.bank_length_m / self.voxel_size))
-        nz = int(math.ceil((max_height + z0 + self.voxel_size) / self.voxel_size))
+        nx = int(np.ceil(self.soil.bank_width_m / self.voxel_size))
+        ny = int(np.ceil(self.soil.bank_length_m / self.voxel_size))
+        nz = int(np.ceil((max_height + z0 + self.voxel_size) / self.voxel_size))
 
         xs = -x_half + np.arange(nx, dtype=np.float32) * self.voxel_size
         ys = y_back + np.arange(ny, dtype=np.float32) * self.voxel_size
@@ -665,9 +658,9 @@ class ExcavatorMPMExample:
 
     def _configure_drucker_prager_regularizer(self) -> None:
         # Smooth inscribed Drucker-Prager fit from the soil prior (c, phi).
-        sin_phi = math.sin(math.radians(self.soil.friction_angle_deg))
-        cos_phi = math.cos(math.radians(self.soil.friction_angle_deg))
-        denom = math.sqrt(3.0) * max(3.0 - sin_phi, 1.0e-6)
+        sin_phi = np.sin(np.radians(self.soil.friction_angle_deg))
+        cos_phi = np.cos(np.radians(self.soil.friction_angle_deg))
+        denom = np.sqrt(3.0) * max(3.0 - sin_phi, 1.0e-6)
         self.dp_alpha = 2.0 * sin_phi / denom
         self.dp_k = 6.0 * self.soil.cohesion_pa * cos_phi / denom
         self.bucket_center_wp = wp.vec3(
@@ -704,7 +697,7 @@ class ExcavatorMPMExample:
                 self.env.bank_front_y,
                 self.soil.spawn_clearance_m,
                 self.soil.bank_height_m,
-                math.tan(math.radians(self.soil.slope_angle_deg)),
+                np.tan(np.radians(self.soil.slope_angle_deg)),
                 self.dp.active_margin_m,
                 self.soil.density_kg_m3,
                 9.81,
@@ -750,7 +743,6 @@ class ExcavatorMPMExample:
         names_l = [name.lower() for name in self.control_joint_names]
         canonical = {
             "swing": ("tankspin_wheel", "tankspin", "swing", "slew"),
-            "boom": ("full_arm_rotation", "full_arm", "boom"),
             "arm": ("lower_arm", "lowerarm", "back_arm", "arm"),
             "stick": ("uppertolow", "upper_to_low", "middle", "stick", "dipper"),
             "bucket": ("scoop1", "scoop", "bucket"),
@@ -773,7 +765,7 @@ class ExcavatorMPMExample:
 
         resolved: dict[str, Optional[int]] = {}
         used: set[int] = set()
-        for key in ("swing", "boom", "arm", "stick", "bucket"):
+        for key in ("swing", "arm", "stick", "bucket"):
             idx = find_best(canonical[key], used)
             if idx is not None:
                 used.add(idx)
@@ -783,10 +775,9 @@ class ExcavatorMPMExample:
             base = self.control_size - 5
             resolved = {
                 "swing": base + 0,
-                "boom": base + 1,
-                "arm": base + 2,
-                "stick": base + 3,
-                "bucket": base + 4,
+                "arm": base + 1,
+                "stick": base + 2,
+                "bucket": base + 3,
             }
         return {k: (v if v is not None and v < self.control_size else None) for k, v in resolved.items()}
 
@@ -807,7 +798,7 @@ class ExcavatorMPMExample:
         )
         print(
             f"DP-like regularizer: enabled={self.dp.enabled}, alpha={self.dp_alpha:.4f}, "
-            f"k={self.dp_k / 1000.0:.2f} kPa, fit={self.dp.matching}"
+            f"k={self.dp_k / 1000.0:.2f} kPa"
         )
         print(
             "Bucket sealing: "
@@ -830,7 +821,6 @@ class ExcavatorMPMExample:
         print(f"  target cohesion for calibration: {self.soil.cohesion_pa / 1000.0:.1f} kPa")
         print(
             f"  DP-like fit: alpha={self.dp_alpha:.4f}, k={self.dp_k / 1000.0:.2f} kPa "
-            f"({self.dp.matching})"
         )
         print(f"Total soil particles: {self.total_particles:,}")
         print("=" * 72)
@@ -988,7 +978,6 @@ class ExcavatorMPMExample:
         s = ExcavatorMPMExample.smoothstep(u)
         return DigPose(
             swing=(1.0 - s) * a.swing + s * b.swing,
-            boom=(1.0 - s) * a.boom + s * b.boom,
             arm=(1.0 - s) * a.arm + s * b.arm,
             stick=(1.0 - s) * a.stick + s * b.stick,
             bucket=(1.0 - s) * a.bucket + s * b.bucket,
@@ -1046,7 +1035,6 @@ class ExcavatorMPMExample:
 
         desired_map = {
             "swing": desired.swing,
-            "boom": desired.boom,
             "arm": desired.arm,
             "stick": desired.stick,
             "bucket": desired.bucket,
