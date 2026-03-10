@@ -21,11 +21,12 @@ from newton.solvers import SolverImplicitMPM
 class ExcavatorMPMExample:
     def __init__(self, viewer, voxel_size=0.03, particles_per_cell=3):
         # Simulation parameters
-        self.fps = 60
+        self.fps = 10
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 4
+        self.sim_substeps = 20
         self.sim_dt = self.frame_dt / self.sim_substeps
+        # ??? motivation to have more mpm substeps
 
         self.viewer = viewer
         self.device = wp.get_device()
@@ -51,7 +52,7 @@ class ExcavatorMPMExample:
         # Use relative path from this script's directory
 
         # Load excavator URDF
-        excavator_urdf = "./excavatorURDF/robot_fixed_alternate.urdf"
+        excavator_urdf = "./excavatorURDF/excavator_boxy.urdf"
         print(f"Loading excavator from: {excavator_urdf}")
         
         # Position excavator at the side of soil pile so it can reach in
@@ -75,10 +76,9 @@ class ExcavatorMPMExample:
         # Apply gains only to actual control slots (not floating base)
         # these values intended to be quite high
         for i in range(control_start, control_end):
-            # the boom base seems to need pretty high ???
             builder.joint_target_ke[i] = 5000.0 # we could choose to make these *extremely* high and rely on urdf values
             builder.joint_target_kd[i] = 500.0
-        builder.joint_target_ke[8] = 12000.0 # artificially increase boom gain, since it seems to be struggling
+        builder.joint_target_ke[8] = 15000.0 # artificially increase boom gain, since it seems to be struggling
 
         # Create MPM soil terrain
         print("Creating MPM soil terrain...")
@@ -95,14 +95,14 @@ class ExcavatorMPMExample:
 
         # Add dump bucket (goal area)
         # Excavator is at (0, 3, 0.5) facing soil at origin.
-        # Bucket is to the LEFT side of the excavator so it can swing and dump.
+        # Bucket is to the side of the excavator so it can swing and dump.
         self.bucket_center = np.array([-4.0, 3.0, 0.0])
         self.bucket_inner_half = np.array([0.75, 1.5, 0.8])  # 1.5m x 1.5m x 1.6m inner
         self.add_dump_bucket(builder)
 
         # Finalize model
         self.model = builder.finalize()
-        self.model.ground = True
+        self.model.gravity.assign(wp.array([wp.vec3(0.0, 0.0, -9.81)], dtype=wp.vec3))
 
         # Print joint information
         print(f"\nExcavator has {self.model.joint_count} joints:")
@@ -132,7 +132,7 @@ class ExcavatorMPMExample:
         mpm_options = SolverImplicitMPM.Options()
         mpm_options.voxel_size = voxel_size
         mpm_options.tolerance = 1.0e-5
-        mpm_options.transfer_scheme = "pic" # apic ???
+        mpm_options.transfer_scheme = "pic" # ???
         mpm_options.grid_type = "sparse"  # "sparse" or "fixed"
         mpm_options.strain_basis = "P0"
         mpm_options.max_iterations = 50
@@ -266,8 +266,8 @@ class ExcavatorMPMExample:
         return int(np.count_nonzero(inside))
 
     def create_mpm_soil(self, builder, voxel_size, particles_per_cell):
-        soil_width = 4.0
-        soil_length = 4.0
+        soil_width = 2.0
+        soil_length = 2.0
         soil_height = 0.8
 
         nx = int(round(soil_width / voxel_size))
@@ -340,10 +340,11 @@ class ExcavatorMPMExample:
 
     def simulate_sand(self):
         """Simulate MPM sand physics"""
-        # TODO add gravity
-        for _ in range(self.sim_substeps):
-            self.mpm_solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
-            self.mpm_solver.project_outside(self.state_1, self.state_1, self.sim_dt)
+        mpm_bonus_factor = 2 # giving it a bonus for particle simulation
+        mpm_dt = self.sim_dt / mpm_bonus_factor
+        for _ in range(self.sim_substeps * mpm_bonus_factor): 
+            self.mpm_solver.step(self.state_0, self.state_1, None, None, mpm_dt)
+            self.mpm_solver.project_outside(self.state_1, self.state_1, mpm_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def apply_control(self):
@@ -359,19 +360,6 @@ class ExcavatorMPMExample:
             return
 
         t = self.sim_time
-        # I'm noticing a lack of self-collision
-        # in robot_fixed_cleaned:
-        # 0 - base rotation! except it seems the track portions spin and the rest stays still
-        # 1 - back left track gear 
-        # 2 - back right track gear
-        # 3 - front left track wheel
-        # 4 - front right track wheel
-        # 5-12 - bottom track portions and left-right bar portions, not clear which
-        # 13 - front left-right rotator, right then left
-        # 14 - back arm, down then up
-        # 15 - middle arm, outwards then inwards
-        # 16 - bucket, tight then open. this one has collision since the visual is purely aesthetic, the collision one is still the simple boxy form
-        
         # in robot_fixed_alternate
         # grounded versions, +1 for float:
         # 0 - base, left then right
@@ -379,9 +367,6 @@ class ExcavatorMPMExample:
         # 2 - back arm, down then up # you really have to exceed the real limit to achieve this, something like -3.5 is necessary to get a hover
         # 3 - middle arm, outwards then inwards # 0.8 usually hovers at full extension
         # 4 - bucket, tight then open
-        # 1 in -.1, .8
-        # 2 in -.4, 1
-        # 3 in -.9, .3
 
         # in robot_fixed_alternate and ungrounded
         # 0 - x
@@ -405,8 +390,8 @@ class ExcavatorMPMExample:
         pos[6] = 0
         pos[7] = 0
         pos[8] = -.5-np.sin(t / 5)
-        pos[9] = np.sin(t / 3)
-        pos[10] = np.sin(t / 2)
+        pos[9] = -np.sin(t / 3)
+        pos[10] = 5
         # pos[10] = 10
         # pos[6] = t
         # pos[6] = 10 * np.sin(t / 2)
@@ -462,8 +447,8 @@ def main():
     viewer, args = newton.examples.init()
 
     # Use default MPM parameters
-    voxel_size = 1 # .05
-    particles_per_cell = 1 # 3
+    voxel_size = .03 # .05
+    particles_per_cell = 10 # 3
 
     # Create simulation
     example = ExcavatorMPMExample(

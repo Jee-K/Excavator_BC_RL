@@ -567,11 +567,43 @@
 <color rgba="0.61568627450980395466 0.81176470588235294379 0.92941176470588238168 1.0"/>
 </material>
 </visual>
-<collision>
+<!-- <collision>
 <origin xyz="0.078718096856661645688 0.9796110677393685684 0.055000000000000492939" rpy="-3.4526773663153991416e-15 5.7817384945015261175e-15 3.0159289474462140923" />
 <geometry>
 <mesh filename="bucket.stl"/>
 </geometry>
+</collision> -->
+<!-- Retention-optimized blocky collision bucket -->
+<!-- Keep the visual mesh for rendering only; use a small number of overlapping boxes for contact. -->
+<!-- back_plate: slightly thicker / taller, but still close to the original cavity shape -->
+<collision>
+<origin xyz="0.2014 0.2989 0.0550" rpy="0 0 3.0159" />
+<geometry><box size="0.565 0.165 0.680" /></geometry>
+</collision>
+<!-- floor_rear: modestly thicker with a bit more overlap into the back plate -->
+<collision>
+<origin xyz="0.3935 0.4380 0.0550" rpy="0 0 3.0159" />
+<geometry><box size="0.185 0.730 0.680" /></geometry>
+</collision>
+<!-- floor_front: keep the original scoop behavior; only enlarge modestly for sealing -->
+<collision>
+<origin xyz="0.3005 0.7420 0.0550" rpy="0 0 3.7800" />
+<geometry><box size="0.185 0.615 0.680" /></geometry>
+</collision>
+<!-- floor_seam_strip: closes the rear/front floor joint without narrowing the bucket mouth -->
+<collision>
+<origin xyz="0.3460 0.5900 0.0550" rpy="0 0 3.3600" />
+<geometry><box size="0.090 0.240 0.680" /></geometry>
+</collision>
+<!-- left_wall: slightly thicker / taller, with more overlap into the floor -->
+<collision>
+<origin xyz="0.2408 0.6114 -0.1970" rpy="0 0 3.0159" />
+<geometry><box size="0.565 0.770 0.165" /></geometry>
+</collision>
+<!-- right_wall: slightly thicker / taller, with more overlap into the floor -->
+<collision>
+<origin xyz="0.2408 0.6114 0.3070" rpy="0 0 3.0159" />
+<geometry><box size="0.565 0.770 0.165" /></geometry>
 </collision>
 <visual>
 <origin xyz="0.17000000000000259348 0.30800000000000071765 0.054999999999999271694" rpy="-3.1415926535897793492 -1.5707963267948956698 0" />
