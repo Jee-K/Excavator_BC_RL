@@ -63,11 +63,11 @@ class DigPose:
     bucket: float
 
 
+# particles per cell is not a reasonable construction, just use voxel size
 @dataclass(frozen=True)
 class SimulationPreset:
     name: str
     voxel_size_m: float
-    particles_per_cell: int
     rigid_substeps: int
     mpm_far: int
     mpm_near: int
@@ -81,7 +81,6 @@ SIM_PRESETS: dict[str, SimulationPreset] = {
     "balanced": SimulationPreset(
         name="balanced",
         voxel_size_m=0.020,
-        particles_per_cell=3,
         rigid_substeps=6,
         mpm_far=1,
         mpm_near=3,
@@ -228,7 +227,6 @@ class ExcavatorMPMExample:
         viewer,
         preset_name: str = "balanced",
         voxel_size: Optional[float] = None,
-        particles_per_cell: Optional[int] = None,
     ):
         if preset_name not in SIM_PRESETS:
             raise ValueError(f"Unknown preset '{preset_name}'. Available: {sorted(SIM_PRESETS)}")
@@ -242,9 +240,6 @@ class ExcavatorMPMExample:
         self.sim_preset = SIM_PRESETS[preset_name]
 
         self.voxel_size = float(voxel_size if voxel_size is not None else self.sim_preset.voxel_size_m)
-        self.particles_per_cell = int(
-            particles_per_cell if particles_per_cell is not None else self.sim_preset.particles_per_cell
-        )
 
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
@@ -626,10 +621,10 @@ class ExcavatorMPMExample:
         occupied_cells = cell_origins[occupancy_mask]
 
         rng = np.random.default_rng(7)
-        jitter = rng.random((occupied_cells.shape[0], self.particles_per_cell, 3), dtype=np.float32) * self.voxel_size
+        jitter = rng.random((occupied_cells.shape[0], 1, 3), dtype=np.float32) * self.voxel_size
         positions = (occupied_cells[:, None, :] + jitter).reshape(-1, 3)
 
-        particle_mass = self.soil.density_kg_m3 * (self.voxel_size ** 3) / float(self.particles_per_cell)
+        particle_mass = self.soil.density_kg_m3 * (self.voxel_size ** 3)
         zero_vel = wp.vec3(0.0, 0.0, 0.0)
         for p in positions:
             builder.add_particle(
@@ -791,7 +786,7 @@ class ExcavatorMPMExample:
         print(f"Joint map: {self.joint_map}")
         print(f"Bucket body index for soil broad-phase: {self.bucket_body_index}")
         print(f"Particles: {self.total_particles:,}")
-        print(f"Voxel size: {self.voxel_size:.3f} m, particles/cell: {self.particles_per_cell}")
+        print(f"Voxel size: {self.voxel_size:.3f} m")
         print(
             "Adaptive soil substeps per rigid step: "
             f"far={self.sim_preset.mpm_far}, near={self.sim_preset.mpm_near}, contact={self.sim_preset.mpm_contact}"
@@ -984,14 +979,14 @@ class ExcavatorMPMExample:
         )
 
     def sample_dig_cycle(self, t: float) -> DigPose:
-        home = DigPose(0.00, 0.72, 0.55, 0.10, 0.55)
-        entry = DigPose(0.04, 0.42, 0.18, 0.22, 0.72)
-        crowd = DigPose(0.08, 0.18, -0.10, 0.28, 0.80)
-        curl = DigPose(0.10, 0.28, -0.02, -0.48, -0.72)
-        lift = DigPose(0.12, 0.62, 0.32, -0.72, -0.88)
-        swing = DigPose(-1.00, 0.58, 0.24, -0.56, -0.82)
-        dump = DigPose(-1.15, 0.50, 0.12, -0.32, 0.76)
-        return_high = DigPose(-0.30, 0.68, 0.40, -0.05, 0.45)
+        home = DigPose(0.00 + 0.72, 0.55, 0.10, 0.55)
+        entry = DigPose(0.04 + 0.42, 0.18, 0.22, 0.72)
+        crowd = DigPose(0.08 + 0.18, -0.10, 0.28, 0.80)
+        curl = DigPose(0.10 + 0.28, -0.02, -0.48, -0.72)
+        lift = DigPose(0.12 + 0.62, 0.32, -0.72, -0.88)
+        swing = DigPose(-1.00 + 0.58, 0.24, -0.56, -0.82)
+        dump = DigPose(-1.15 + 0.50, 0.12, -0.32, 0.76)
+        return_high = DigPose(-0.30 + 0.68, 0.40, -0.05, 0.45)
 
         phase_times = (
             (0.0, 1.6, home, entry),
@@ -1028,7 +1023,7 @@ class ExcavatorMPMExample:
 
         targets = self._joint_target_host.copy()
         if self.sim_time < self.settle_duration:
-            desired = DigPose(0.0, 0.72, 0.55, 0.10, 0.55)
+            desired = DigPose(0.72, 0.55, 0.10, 0.55)
         else:
             cycle_t = (self.sim_time - self.settle_duration) % self.dig_cycle_duration
             desired = self.sample_dig_cycle(cycle_t)

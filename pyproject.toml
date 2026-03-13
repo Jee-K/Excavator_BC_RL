@@ -1,0 +1,45 @@
+[project]
+name = "outer-sim"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    # Outer-project direct deps
+    "numpy",
+    "pyyaml>=6.0.2",
+
+    # Inner project from local source, with Newton's sim/importer/viewer stack
+    "newton[examples]",
+
+    # Torch in the outer env
+    "torch>=2.7.0",
+    "torchvision"
+]
+
+[tool.uv.sources]
+# Inner project: this replaces the old `-e .` from when you were inside ./newton
+newton = { path = "./soil_simulation", editable = true }
+
+# Re-state non-default sources at the outer/root project level
+mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp" }
+warp-lang = { index = "nvidia" }
+mujoco = { index = "mujoco" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "mujoco"
+url = "https://py.mujoco.org"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
