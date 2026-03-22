@@ -1364,11 +1364,17 @@ class ViewerGL(ViewerBase):
                 changed, self.renderer.draw_wireframe = imgui.checkbox("Wireframe", self.renderer.draw_wireframe)
 
                 # Light color
-                changed, self.renderer._light_color = imgui.color_edit3("Light Color", self.renderer._light_color)
+                # changed, self.renderer._light_color = imgui.color_edit3("Light Color", self.renderer._light_color)
+                changed, col = imgui.color_edit3("Light Color", imgui.ImVec4(*self.renderer._light_color, 1.0))
+                self.renderer._light_color = (col.x, col.y, col.z)
                 # Sky color
-                changed, self.renderer.sky_upper = imgui.color_edit3("Sky Color", self.renderer.sky_upper)
+                # changed, self.renderer.sky_upper = imgui.color_edit3("Sky Color", self.renderer.sky_upper)
+                changed, col = imgui.color_edit3("Sky Color", imgui.ImVec4(*self.renderer.sky_upper, 1.0))
+                self.renderer.sky_upper = (col.x, col.y, col.z)
                 # Ground color
-                changed, self.renderer.sky_lower = imgui.color_edit3("Ground Color", self.renderer.sky_lower)
+                # changed, self.renderer.sky_lower = imgui.color_edit3("Ground Color", self.renderer.sky_lower)
+                changed, col = imgui.color_edit3("Ground Color", imgui.ImVec4(*self.renderer.sky_lower, 1.0))
+                self.renderer.sky_lower = (col.x, col.y, col.z)
 
             # Wind Effects section
             imgui.set_next_item_open(False, imgui.Cond_.once)
