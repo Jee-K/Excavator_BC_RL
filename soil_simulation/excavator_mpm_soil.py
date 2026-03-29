@@ -16,13 +16,9 @@ import newton
 import newton.examples
 from newton.solvers import SolverImplicitMPM
 
-# TODO: this solution can use fixed background kinda, but can't seem to use graphs
-
 @dataclass(frozen=True)
 class SoilProperties:
     # material information
-    name: str = "moist_sandy_loam"
-
     # mpm primaries
     # density_kg_m3: float = 1800.0
     # youngs_modulus_pa: float = 2.0e7
@@ -73,14 +69,13 @@ class DigPose:
     bucket: float
 
 
-# particles per cell is not a reasonable construction, just use voxel size
 @dataclass(frozen=True)
 class SimulationFidelity:
     voxel_size_m: float
     rigid_substeps: int
     mpm_iterations_per_rigid: int
     rigid_ls_iterations: int
-    rigid_njmax: int # ???
+    rigid_njmax: int # the values for this aren't particularly well motivated, but do fit precedent
     fps: int
     projections : int
     particles_per_cell: int
@@ -171,6 +166,7 @@ class ExcavatorMPM:
         viewer,
         fidelity: SimulationFidelity,
         enable_cuda_graph: bool = True,
+        debug: bool = False
     ):
 
         self.viewer = viewer
@@ -178,6 +174,8 @@ class ExcavatorMPM:
         self.soil_info = SoilProperties()
         self.env_info = EnvironmentPreset()
         self.fidelity = fidelity
+
+        self.debug = debug
 
         self.voxel_size = self.fidelity.voxel_size_m
 
@@ -200,23 +198,9 @@ class ExcavatorMPM:
         # ------------------------------------------------------------------
         self.bucket_proxy_radius_m = 0.45
         self.coupled_graph = None
-
-        # ------------------------------------------------------------------
-        # Physical collider tuning.
-        # Keep margin small because it shifts the effective surface; use a
-        # slightly larger gap to enable earlier detection without bloating the
-        # bucket too much. Defaults are intentionally conservative.
-        # ------------------------------------------------------------------
-        self.shape_margin_m = min(max(0.08 * self.voxel_size, 0.0015), 0.0060)
-        self.shape_gap_m = min(max(0.25 * self.voxel_size, 0.0080), 0.0250)
-        self.soft_contact_margin_m = self.shape_gap_m
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Apply rigid defaults before URDF import. In this Newton build,
-        # margin/gap live on SolverMuJoCo rather than on ShapeConfig, so keep
-        # the builder-side defaults focused on friction/contact stiffness and
-        # particle-collision flags only.
+        # Apply rigid defaults before URDF import
         self.configure_rigid_defaults(builder)
         builder.default_shape_cfg.has_particle_collision = True
         builder.default_shape_cfg.is_solid = True
@@ -258,11 +242,11 @@ class ExcavatorMPM:
         # Limit mpm collisions to only the portions we expect to be relevant. 
         # The actual performance impact of this is debatable
         for body in range(builder.body_count):
-            if "bucketry" not in builder.body_key[body]: # !!! must remove the True or to have collision
+            if "bucketry" not in builder.body_key[body]: 
                 for shape in builder.body_shapes[body]:
                     builder.shape_flags[shape] = builder.shape_flags[shape] & ~newton.ShapeFlags.COLLIDE_PARTICLES
 
-        # !!! control gains
+        # control gains
         for i in range(control_start, control_end):
             builder.joint_target_ke[i] = 5000.0
             builder.joint_target_kd[i] = 500.0
@@ -297,50 +281,18 @@ class ExcavatorMPM:
         mpm_options.collider_basis = "Q1" # big alt is P0
         mpm_options.collider_velocity_mode = "finite_difference"
 
-        mujoco_solver_kwargs = dict(
+        self.solver = newton.solvers.SolverMuJoCo(
+            self.model,
             ls_iterations=self.fidelity.rigid_ls_iterations,
             njmax=self.fidelity.rigid_njmax,
-            margin=self.shape_margin_m,
-            gap=self.shape_gap_m,
             ccd_iterations = 60,
         )
-        try:
-            self.solver = newton.solvers.SolverMuJoCo(
-                self.model,
-                **mujoco_solver_kwargs,
-            )
-            self._solver_accepts_margin_gap = True
-        except TypeError:
-            mujoco_solver_kwargs.pop("margin", None)
-            mujoco_solver_kwargs.pop("gap", None)
-            self.solver = newton.solvers.SolverMuJoCo(
-                self.model,
-                **mujoco_solver_kwargs,
-            )
-            self._solver_accepts_margin_gap = False
-            print("Warning: SolverMuJoCo margin/gap kwargs unsupported in this build; using solver defaults.")
-        self.mpm_model = None
-        model_ctor = getattr(SolverImplicitMPM, "Model", None)
-        if model_ctor is not None:
-            try:
-                self.mpm_model = model_ctor(self.model, mpm_options)
-            except Exception as exc:
-                self.mpm_model = None
-                print(f"Warning: native MPM material model unavailable in this build: {exc}")
 
-        solver_input = self.mpm_model if self.mpm_model is not None else self.model
-        try:
-            self.mpm_solver = SolverImplicitMPM(solver_input, mpm_options)
-        except Exception:
-            self.mpm_solver = SolverImplicitMPM(self.model, mpm_options)
+        self.mpm_solver = SolverImplicitMPM(self.model, mpm_options)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.mpm_state = self.model.state()
-        # Only the dedicated MPM working state needs solver-specific
-        # enrichment in this split rigid/MPM loop. Keeping state_0/state_1
-        # lean avoids duplicating APIC/Q1 auxiliary particle storage.
-        self._enrich_state_for_mpm(self.mpm_state)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
         self._copy_state_to_mpm_state()
 
@@ -349,19 +301,10 @@ class ExcavatorMPM:
         self.collider_body_qd = wp.zeros_like(self.state_0.body_qd)
         self.collider_body_q.assign(self.state_0.body_q)
         self.collider_body_qd.assign(self.state_0.body_qd)
-        self._collider_accepts_body_qd = False
-        try:
-            self.mpm_solver.setup_collider(
-                body_mass=wp.zeros_like(self.model.body_mass),
-                body_q=self.collider_body_q,
-                body_qd=self.collider_body_qd,
-            )
-            self._collider_accepts_body_qd = True
-        except TypeError:
-            self.mpm_solver.setup_collider(
-                body_mass=wp.zeros_like(self.model.body_mass),
-                body_q=self.collider_body_q,
-            )
+        self.mpm_solver.setup_collider(
+            body_mass=wp.zeros_like(self.model.body_mass),
+            body_q=self.collider_body_q,
+        )
 
         # Two-way coupling buffers (adapted from Newton's mpm_twoway_coupling example).
         max_nodes = 1 << 20
@@ -432,8 +375,7 @@ class ExcavatorMPM:
             with np.load(self.target_replay_path, allow_pickle=False) as data:
                 key, states = self._select_numeric_array_from_npz(data)
         except Exception as exc:
-            print(f"Failed to load target-state replay file '{self.target_replay_path.name}': {exc}")
-            return
+            raise RuntimeError(f"Failed to load target-state replay file '{self.target_replay_path.name}': {exc}")
 
         states = np.asarray(states, dtype=np.float64)
         if states.ndim == 1:
@@ -483,8 +425,10 @@ class ExcavatorMPM:
     def _get_replay_desired_map(self) -> Optional[dict[str, float]]:
         row = self._sample_target_state_row(self.sim_time)
 
+        # ??? interpolate somehow
+
         return {
-            "swing": 0, # !!!
+            "swing": float(row[0]) - 2, # TODO: this value often needs modification to be placed into reasonable locations, hence the -2 here
             "arm": float(row[1]),
             "stick": float(row[2]),
             "bucket": float(row[3]),
@@ -534,14 +478,6 @@ class ExcavatorMPM:
         bx, by, bz = self.bucket_center
         iw, il, idepth = self.bucket_inner_half
         t = self.env_info.bucket_wall_thickness
-
-        # cfg = newton.ModelBuilder.ShapeConfig(
-        #     ke=2.0e5,
-        #     kd=2.0e3,
-        #     kf=1.0e3,
-        #     mu=0.6,
-        #     density=0.0,
-        # )
         cfg = self.static_particle_contact_cfg
 
         builder.add_shape_box(
@@ -585,16 +521,7 @@ class ExcavatorMPM:
             hz=0.5 * idepth,
         )
 
-    def _enrich_state_for_mpm(self, state) -> None:
-        enrich = getattr(self.mpm_solver, "enrich_state", None)
-        if enrich is None:
-            return
-        try:
-            enrich(state)
-        except Exception:
-            pass
-
-    @staticmethod
+    @staticmethod # ??? what is this function doing
     def _copy_assignable_fields(src, dst, prefixes: tuple[str, ...]) -> None:
         for name in dir(src):
             if not any(name.startswith(prefix) for prefix in prefixes):
@@ -799,13 +726,8 @@ class ExcavatorMPM:
     def _sync_mpm_collider_pose(self, source_state=None) -> None:
         source_state = self.state_0 if source_state is None else source_state
         self.collider_body_q.assign(source_state.body_q)
-        if self._collider_accepts_body_qd:
-            self.collider_body_qd.assign(source_state.body_qd)
 
-    def _zero_body_force_buffer(self, buf) -> None:
-        buf.assign(self._zero_body_force)
-
-    def _collect_collider_impulses(self, state) -> bool:
+    def _collect_collider_impulses(self, state) -> bool: # ???
         try:
             collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver._collect_collider_impulses(state)
         except Exception:
@@ -836,70 +758,6 @@ class ExcavatorMPM:
             ],
         )
 
-    @staticmethod
-    def _coerce_vec3(obj) -> Optional[np.ndarray]:
-        if obj is None:
-            return None
-        if isinstance(obj, np.void):
-            if obj.dtype.names:
-                for key in ("p", "pos", "position", "translation"):
-                    if key in obj.dtype.names:
-                        return ExcavatorMPM._coerce_vec3(obj[key])
-                for key in obj.dtype.names:
-                    candidate = ExcavatorMPM._coerce_vec3(obj[key])
-                    if candidate is not None:
-                        return candidate
-            return None
-        if isinstance(obj, np.ndarray):
-            if obj.dtype.names:
-                return ExcavatorMPM._coerce_vec3(obj[()])
-            flat = np.asarray(obj, dtype=np.float64).reshape(-1)
-            if flat.size >= 3:
-                return flat[:3]
-            return None
-        if hasattr(obj, "p"):
-            return ExcavatorMPM._coerce_vec3(getattr(obj, "p"))
-        if hasattr(obj, "tolist"):
-            return ExcavatorMPM._coerce_vec3(obj.tolist())
-        if isinstance(obj, (tuple, list)):
-            if len(obj) >= 3 and all(np.isscalar(v) for v in obj[:3]):
-                return np.asarray(obj[:3], dtype=np.float64)
-            for item in obj:
-                candidate = ExcavatorMPM._coerce_vec3(item)
-                if candidate is not None:
-                    return candidate
-        return None
-
-    def _get_bucket_world_position(self) -> Optional[np.ndarray]:
-        if self.bucket_body_index is None:
-            return None
-        try:
-            body_q_host = self.state_0.body_q.numpy()
-            if self.bucket_body_index >= len(body_q_host):
-                return None
-            return self._coerce_vec3(body_q_host[self.bucket_body_index])
-        except Exception:
-            return None
-
-    def refresh_bucket_load_estimate(self) -> None:
-        """CPU-side diagnostics update kept off the hot path.
-
-        This function intentionally performs host reads and should only be called
-        occasionally (for example at score-print intervals), not every frame.
-        """
-        pos = self._get_bucket_world_position()
-        if pos is None or self.model.particle_count == 0:
-            return
-
-        try:
-            positions = self.state_0.particle_q.numpy()
-        except Exception:
-            return
-
-        radius = self.bucket_proxy_radius_m + 0.45
-        delta = positions - pos[None, :]
-        near = np.einsum("ij,ij->i", delta, delta) <= radius * radius
-
     def simulate_rigid_substep(self, dt: float, apply_viewer_forces: bool = True) -> None:
         self.state_0.clear_forces()
         if apply_viewer_forces:
@@ -929,8 +787,9 @@ class ExcavatorMPM:
                 self.mpm_state.body_qd,
             ],
         )
-        self._zero_body_force_buffer(self.body_f_from_soil)
-        dt_divisor = float(max(count * dt, 1.0e-6))
+
+        self.body_f_from_soil.assign(self._zero_body_force) # zeroes body force buffer
+        dt_divisor = float(count * dt)
         # this loop is by far the biggest compute-time sink
         for _ in range(count):
             self._sync_mpm_collider_pose(self.mpm_state)
@@ -955,44 +814,6 @@ class ExcavatorMPM:
         u = float(np.clip(u, 0.0, 1.0))
         return u * u * (3.0 - 2.0 * u)
 
-    @staticmethod
-    def blend_pose(a: DigPose, b: DigPose, u: float) -> DigPose:
-        s = ExcavatorMPM.smoothstep(u)
-        return DigPose(
-            swing=(1.0 - s) * a.swing + s * b.swing,
-            arm=(1.0 - s) * a.arm + s * b.arm,
-            stick=(1.0 - s) * a.stick + s * b.stick,
-            bucket=(1.0 - s) * a.bucket + s * b.bucket,
-        )
-
-    def sample_dig_cycle(self, t: float) -> DigPose:
-        home = DigPose(0.00 + 0.72, 0.55, 0.10, 0.55)
-        entry = DigPose(0.04 + 0.42, 0.18, 0.22, 0.72)
-        crowd = DigPose(0.08 + 0.18, -0.10, 0.28, 0.80)
-        curl = DigPose(0.10 + 0.28, -0.02, -0.48, -0.72)
-        lift = DigPose(0.12 + 0.62, 0.32, -0.72, -0.88)
-        swing = DigPose(-1.00 + 0.58, 0.24, -0.56, -0.82)
-        dump = DigPose(-1.15 + 0.50, 0.12, -0.32, 0.76)
-        return_high = DigPose(-0.30 + 0.68, 0.40, -0.05, 0.45)
-
-        phase_times = (
-            (0.0, 1.6, home, entry),
-            (1.6, 3.4, entry, crowd),
-            (3.4, 5.0, crowd, curl),
-            (5.0, 6.8, curl, lift),
-            (6.8, 8.8, lift, swing),
-            (8.8, 10.0, swing, dump),
-            (10.0, 12.0, dump, return_high),
-        )
-
-        if t >= self.dig_cycle_duration:
-            return return_high
-        for t0, t1, pose0, pose1 in phase_times:
-            if t <= t1:
-                u = (t - t0) / max(t1 - t0, 1.0e-6)
-                return self.blend_pose(pose0, pose1, u)
-        return return_high
-
     def apply_control(self) -> None:
         if self.control_size == 0:
             return
@@ -1000,13 +821,8 @@ class ExcavatorMPM:
         targets = self._joint_target_host.copy()
         desired_map = self._get_replay_desired_map()
 
-        if desired_map is None:
-            raise RuntimeError()
-            if self.sim_time < self.settle_duration:
-                desired = DigPose(0.0, 0.55, 0.10, 0.55)
-            else:
-                cycle_t = (self.sim_time - self.settle_duration) % self.dig_cycle_duration
-                desired = self.sample_dig_cycle(cycle_t)
+        if self.sim_time < self.settle_duration:
+            desired = DigPose(0.0, 0.55, 0.10, 0.55)
 
             desired_map = {
                 "swing": desired.swing,
@@ -1022,13 +838,11 @@ class ExcavatorMPM:
             "bucket": 3.0,
         }
 
-        print(self.sim_time)
-        # print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
-
         q_prevs = self.state_0.joint_q.numpy()
-        print(q_prevs[-4:])
 
-        for idx, section in enumerate(["swing", "arm", "stick", "bucket"], start=6):
+        for section in self.joint_map.keys():
+            idx = self.joint_map[section]
+
             q_prev = q_prevs[idx]
             dq_max = float(joint_vel_limit[section]) * self.frame_dt
             q_cmd = desired_map[section]
@@ -1037,21 +851,13 @@ class ExcavatorMPM:
             q_cmd = desired_map[section]
             targets[idx] = q_cmd
 
-        print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
-        print(targets[-4:])
+        if self.debug:
+            print(self.sim_time)
+            print(q_prevs[-4:])
+            print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
+            print(targets[-4:])
         
-
         self.control.joint_target_pos.assign(targets)
-
-        # if int(self.sim_time) % 1 == 0 and self.sim_time - int(self.sim_time) < self.frame_dt:
-        #     print(targets)
-        #     replay_info = "manual_demo"
-        #     if self.target_replay_active:
-        #         replay_info = (
-        #             f"target_replay[{self.target_replay_key}] "
-        #         )
-        #     print(f"\n[t={self.sim_time:.1f}s] Control target: {targets[6:10]} ({replay_info})")
-        #     print(f"  Current pos: [{', '.join([format(float(x), '6.3f') for x in self.state_0.joint_q.numpy()])}]")
 
     # ------------------------------------------------------------------
     # Task metrics / main loop
@@ -1086,13 +892,14 @@ class ExcavatorMPM:
         self.sim_time += self.frame_dt
 
         if self.sim_time - self.last_score_print >= self.score_print_interval:
-            self.refresh_bucket_load_estimate()
             self.particles_in_bucket = self.count_particles_in_bucket()
-            pct = 100.0 * self.particles_in_bucket / max(self.total_particles, 1)
-            print(
-                f"\n[t={self.sim_time:.1f}s] SCORE: {self.particles_in_bucket:,} / {self.total_particles:,} "
-                f"particles in bucket ({pct:.2f}%) "
-            )
+
+            if self.debug:
+                pct = 100.0 * self.particles_in_bucket / max(self.total_particles, 1)
+                print(
+                    f"\n[t={self.sim_time:.1f}s] SCORE: {self.particles_in_bucket:,} / {self.total_particles:,} "
+                    f"particles in bucket ({pct:.2f}%) "
+                )
             self.last_score_print = self.sim_time
 
 
@@ -1108,6 +915,7 @@ def main() -> None:
     example = ExcavatorMPM(
         viewer,
         fidelity=SIM_PRESETS["experimental"],
+        debug=True
     )
 
     while viewer.is_running():
