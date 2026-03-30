@@ -78,7 +78,6 @@ class SimulationFidelity:
     rigid_njmax: int # the values for this aren't particularly well motivated, but do fit precedent
     fps: int
     projections : int
-    particles_per_cell: int
 
 
 SIM_PRESETS: dict[str, SimulationFidelity] = {
@@ -90,7 +89,6 @@ SIM_PRESETS: dict[str, SimulationFidelity] = {
         rigid_njmax=260,
         fps = 30,
         projections = 2,
-        particles_per_cell = 2,
     ),
     "experimental": SimulationFidelity(
         voxel_size_m=0.030,
@@ -100,7 +98,6 @@ SIM_PRESETS: dict[str, SimulationFidelity] = {
         rigid_njmax=260,
         fps = 60,
         projections = 1,
-        particles_per_cell = 1,
     )
 }
 
@@ -163,7 +160,7 @@ def add_spatial_force_inplace(
 class ExcavatorMPM:
     def __init__(
         self,
-        viewer,
+        viewer: newton.viewer,
         fidelity: SimulationFidelity,
         enable_cuda_graph: bool = True,
         debug: bool = False
@@ -190,13 +187,7 @@ class ExcavatorMPM:
         self.score_print_interval = 5.0
         self.last_score_print = 0.0
         self.settle_duration = 0.5
-        self.dig_cycle_duration = 12.0
 
-        # ------------------------------------------------------------------
-        # Contact scheduling thresholds (planner / adaptive stepping only).
-        # These are *not* physical collision margins.
-        # ------------------------------------------------------------------
-        self.bucket_proxy_radius_m = 0.45
         self.coupled_graph = None
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
@@ -267,8 +258,6 @@ class ExcavatorMPM:
 
         self.bucket_body_index = self.model.body_key.index('bucketry')
 
-        self._build_excavation_aabb()
-
         mpm_options = SolverImplicitMPM.Options()
         mpm_options.voxel_size = self.voxel_size
         mpm_options.tolerance = 1.0e-5
@@ -298,10 +287,11 @@ class ExcavatorMPM:
 
         # Dedicated collider pose/velocity buffers for the MPM contact path.
         self.collider_body_q = wp.zeros_like(self.state_0.body_q)
-        self.collider_body_qd = wp.zeros_like(self.state_0.body_qd)
+        # self.collider_body_qd = wp.zeros_like(self.state_0.body_qd)
         self.collider_body_q.assign(self.state_0.body_q)
-        self.collider_body_qd.assign(self.state_0.body_qd)
+        # self.collider_body_qd.assign(self.state_0.body_qd)
         self.mpm_solver.setup_collider(
+            model=self.model,
             body_mass=wp.zeros_like(self.model.body_mass),
             body_q=self.collider_body_q,
         )
@@ -321,18 +311,17 @@ class ExcavatorMPM:
         self._joint_target_host = self.control.joint_target_pos.numpy()
         self.control_size = int(self._joint_target_host.shape[0])
 
-        self.control_joint_names = self.model.joint_key
         self.control_lower, self.control_upper = self.model.joint_limit_lower, self.model.joint_limit_upper
         self.joint_map = {"swing": 6, "arm":7, "stick":8, "bucket":9}
 
+        # TODO
+        # this replay information will need to be cut out, to some extent, somehow
+        # likely, we'll replace this with an option to pass in a function
         self.target_replay_path = Path("./bc_component/BC_dataset/dig/dig_2_bc_dataset.npz")
         self.target_replay_hz = 10.0
-        self.target_replay_loop = True
-        self.target_replay_interp = "linear"
         self.target_replay_start_time_s = 0.0
         self.target_replay_states: Optional[np.ndarray] = None
         self.target_replay_key: Optional[str] = None
-        self.target_replay_active = False
         self._load_target_state_replay()
 
         self.total_particles = int(self.model.particle_count)
@@ -342,7 +331,7 @@ class ExcavatorMPM:
         self.viewer.show_particles = True
         self.viewer.show_visual = False
         self.viewer.show_collision = True
-        self.viewer.show_cloth = False
+        self.viewer.show_triangles = False # corresponds to the cloth option
 
         # self.capture() # !!!
 
@@ -402,30 +391,18 @@ class ExcavatorMPM:
             f"file={self.target_replay_path.name}",
             f"array={key}",
             f"hz={self.target_replay_hz:.3f}",
-            f"loop={self.target_replay_loop}",
             f"duration_s={duration_s:.3f}",
         )
 
-    def _sample_target_state_row(self, sim_time_s: float) -> Optional[np.ndarray]:
-
+    def _get_replay_desired_map(self, time: float) -> Optional[dict[str, float]]:
         states = self.target_replay_states
-        n = int(states.shape[0])
 
-        replay_time = max(0.0, float(sim_time_s) - self.target_replay_start_time_s)
-        replay_sample = replay_time * float(self.target_replay_hz)
-        max_sample = float(n - 1)
+        replay_sample = time * float(self.target_replay_hz)
 
-        replay_sample = float(np.clip(replay_sample, 0.0, max_sample))
+        replay_sample = np.clip(replay_sample, 0.0, states.shape[0] - 1)
+        row = states[int(np.floor(replay_sample))]
 
-        idx0 = int(np.floor(replay_sample))
-
-        # return states[idx0] # could choose to interpolate instead
-        return states[idx0]
-
-    def _get_replay_desired_map(self) -> Optional[dict[str, float]]:
-        row = self._sample_target_state_row(self.sim_time)
-
-        # ??? interpolate somehow
+        # ??? interpolate
 
         return {
             "swing": float(row[0]) - 2, # TODO: this value often needs modification to be placed into reasonable locations, hence the -2 here
@@ -521,43 +498,7 @@ class ExcavatorMPM:
             hz=0.5 * idepth,
         )
 
-    @staticmethod # ??? what is this function doing
-    def _copy_assignable_fields(src, dst, prefixes: tuple[str, ...]) -> None:
-        for name in dir(src):
-            if not any(name.startswith(prefix) for prefix in prefixes):
-                continue
-            if not hasattr(dst, name):
-                continue
-            src_attr = getattr(src, name)
-            dst_attr = getattr(dst, name)
-            if not hasattr(dst_attr, "assign"):
-                continue
-            try:
-                dst_attr.assign(src_attr)
-            except Exception:
-                pass
-
-    def _particle_cell_offsets(self) -> np.ndarray:
-        ppc = max(1, int(self.fidelity.particles_per_cell))
-        if ppc == 1:
-            return np.array([[0.5, 0.5, 0.5]], dtype=np.float32)
-        if ppc == 2:
-            return np.array([
-                [0.25, 0.25, 0.25],
-                [0.75, 0.75, 0.75],
-            ], dtype=np.float32)
-        if ppc == 4:
-            return np.array([
-                [0.25, 0.25, 0.25],
-                [0.75, 0.75, 0.25],
-                [0.75, 0.25, 0.75],
-                [0.25, 0.75, 0.75],
-            ], dtype=np.float32)
-        grid_n = int(np.ceil(ppc ** (1.0 / 3.0)))
-        coords = (np.arange(grid_n, dtype=np.float32) + 0.5) / float(grid_n)
-        grid = np.stack(np.meshgrid(coords, coords, coords, indexing="ij"), axis=-1).reshape(-1, 3)
-        return grid[:ppc].astype(np.float32, copy=False)
-
+    # ??? consider using some of these values to improve simulation
     # def _compute_native_mpm_material_arrays(self) -> dict[str, np.ndarray]:
     #     particle_count = int(self.model.particle_count)
     #     phi = np.radians(self.soil_info.friction_angle_deg)
@@ -623,17 +564,6 @@ class ExcavatorMPM:
         builder.mpm_nu = nu
         builder.mpm_mu = e / (2.0 * (1.0 + nu))
         builder.mpm_lambda = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
-
-    def _build_excavation_aabb(self) -> None:
-        x_half = 0.5 * self.env_info.bank_width_m
-        self.excavation_aabb_min = np.array(
-            [-x_half - 0.30, self.env_info.bank_back_y - 0.30, -0.05],
-            dtype=np.float64,
-        )
-        self.excavation_aabb_max = np.array(
-            [x_half + 0.30, self.env_info.bank_front_y + 0.30, self.env_info.bank_height_m + 0.20],
-            dtype=np.float64,
-        )
 
 
     # ------------------------------------------------------------------
@@ -718,16 +648,26 @@ class ExcavatorMPM:
             self._restore_runtime_state(snapshot)
 
     def _copy_state_to_mpm_state(self) -> None:
-        self._copy_assignable_fields(self.state_0, self.mpm_state, prefixes=("body_", "particle_", "mpm_", "mpm_particle_"))
+        
+        self.mpm_state.body_f = self.state_0.body_f
+        self.mpm_state.particle_q = self.state_0.particle_q
+        self.mpm_state.particle_qd = self.state_0.particle_qd
+        self.mpm_state.body_q = self.state_0.body_q
+        self.mpm_state.body_qd = self.state_0.body_qd
+        self.mpm_state.particle_f = self.state_0.particle_f
 
     def _copy_particles_from_mpm_state(self) -> None:
-        self._copy_assignable_fields(self.mpm_state, self.state_0, prefixes=("particle_", "mpm_", "mpm_particle_"))
+        
+        self.state_0.particle_q = self.mpm_state.particle_q
+        self.state_0.particle_qd = self.mpm_state.particle_qd
+        self.state_0.particle_f = self.mpm_state.particle_f
+
 
     def _sync_mpm_collider_pose(self, source_state=None) -> None:
         source_state = self.state_0 if source_state is None else source_state
         self.collider_body_q.assign(source_state.body_q)
 
-    def _collect_collider_impulses(self, state) -> bool: # ???
+    def _collect_collider_impulses(self, state) -> bool:
         try:
             collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver._collect_collider_impulses(state)
         except Exception:
@@ -809,17 +749,12 @@ class ExcavatorMPM:
     # ------------------------------------------------------------------
     # Controller (kept mainly for the built-in digging demo)
     # ------------------------------------------------------------------
-    @staticmethod
-    def smoothstep(u: float) -> float:
-        u = float(np.clip(u, 0.0, 1.0))
-        return u * u * (3.0 - 2.0 * u)
-
     def apply_control(self) -> None:
         if self.control_size == 0:
             return
 
         targets = self._joint_target_host.copy()
-        desired_map = self._get_replay_desired_map()
+        
 
         if self.sim_time < self.settle_duration:
             desired = DigPose(0.0, 0.55, 0.10, 0.55)
@@ -830,6 +765,8 @@ class ExcavatorMPM:
                 "stick": desired.stick,
                 "bucket": desired.bucket,
             }
+        else:
+            desired_map = self._get_replay_desired_map(self.sim_time - self.settle_duration)
 
         joint_vel_limit = {
             "swing": 1.0,
@@ -857,6 +794,11 @@ class ExcavatorMPM:
             print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
             print(targets[-4:])
         
+        # may desire some way to detect if the excavator leaves the platform
+        # for our purposes, we'll presume that leaving the platform is very unlikely
+        # to achieve any positive results within the time limit and just
+        # leave it at that
+
         self.control.joint_target_pos.assign(targets)
 
     # ------------------------------------------------------------------
@@ -884,7 +826,8 @@ class ExcavatorMPM:
         self.apply_control()
 
         if self.coupled_graph:
-            print("Success")
+            if self.debug:
+                print("Graph does exist, attempting launch")
             wp.capture_launch(self.coupled_graph)
         else:
             self.simulate_coupled_frame_fixed(apply_viewer_forces=True)
