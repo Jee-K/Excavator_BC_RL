@@ -60,15 +60,6 @@ class EnvironmentPreset:
     bank_front_y: float = 1.10
     bank_back_y: float = -1.10
 
-
-@dataclass(frozen=True)
-class DigPose:
-    swing: float
-    arm: float
-    stick: float
-    bucket: float
-
-
 @dataclass(frozen=True)
 class SimulationFidelity:
     voxel_size_m: float
@@ -282,14 +273,15 @@ class ExcavatorMPM:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.mpm_state = self.model.state()
+        self.mpm_state.body_q = wp.empty_like(self.state_0.body_q)
+        self.mpm_state.body_qd = wp.empty_like(self.state_0.body_qd)
+        self.mpm_state.body_f = wp.empty_like(self.state_0.body_f)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
         self._copy_state_to_mpm_state()
 
-        # Dedicated collider pose/velocity buffers for the MPM contact path.
+        # Collider buffer for the MPM contact path.
         self.collider_body_q = wp.zeros_like(self.state_0.body_q)
-        # self.collider_body_qd = wp.zeros_like(self.state_0.body_qd)
         self.collider_body_q.assign(self.state_0.body_q)
-        # self.collider_body_qd.assign(self.state_0.body_qd)
         self.mpm_solver.setup_collider(
             model=self.model,
             body_mass=wp.zeros_like(self.model.body_mass),
@@ -301,7 +293,7 @@ class ExcavatorMPM:
         self.collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
         self.collider_impulse_pos = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
         self.collider_impulse_ids = wp.full(max_nodes, value=-1, dtype=int, device=self.model.device)
-        self.collider_body_id = getattr(self.mpm_solver, "collider_body_index", None)
+        self.collider_body_id = self.mpm_solver.collider_body_index
         self.body_f_from_soil = wp.zeros_like(self.state_0.body_f)
         self.body_f_from_soil_prev = wp.zeros_like(self.state_0.body_f)
         self._zero_body_force = wp.zeros_like(self.state_0.body_f)
@@ -313,6 +305,12 @@ class ExcavatorMPM:
 
         self.control_lower, self.control_upper = self.model.joint_limit_lower, self.model.joint_limit_upper
         self.joint_map = {"swing": 6, "arm":7, "stick":8, "bucket":9}
+        self.joint_vel_limit = {
+            "swing": 1.0,
+            "arm": 0.8,
+            "stick": 1.5,
+            "bucket": 3.0,
+        }
 
         # TODO
         # this replay information will need to be cut out, to some extent, somehow
@@ -335,9 +333,7 @@ class ExcavatorMPM:
 
         # self.capture() # !!!
 
-    # ------------------------------------------------------------------
     # Target-state replay inputs
-    # ------------------------------------------------------------------
     @staticmethod
     def _select_numeric_array_from_npz(data: np.lib.npyio.NpzFile) -> tuple[str, np.ndarray]:
         preferred_keys = ("target_states", "states", "targets", "target", "arr_0")
@@ -411,9 +407,7 @@ class ExcavatorMPM:
             "bucket": float(row[3]),
         }
 
-    # ------------------------------------------------------------------
     # Scene and material setup
-    # ------------------------------------------------------------------
     def configure_rigid_defaults(self, builder) -> None:
         builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
             armature=0.05,
@@ -520,7 +514,6 @@ class ExcavatorMPM:
     #     }
 
     def create_mpm_soil_bank(self, builder : newton.ModelBuilder) -> None:
-        x_half = 0.5 * self.env_info.bank_width_m
         y_front = self.env_info.bank_front_y
         y_back = self.env_info.bank_back_y
         max_height = self.env_info.bank_height_m
@@ -531,7 +524,7 @@ class ExcavatorMPM:
         ny = int(np.ceil(self.env_info.bank_length_m / self.voxel_size))
         nz = int(np.ceil((max_height + z0 + self.voxel_size) / self.voxel_size))
 
-        xs = -x_half + np.arange(nx, dtype=np.float32) * self.voxel_size
+        xs = -0.5 * self.env_info.bank_width_m + np.arange(nx, dtype=np.float32) * self.voxel_size
         ys = y_back + np.arange(ny, dtype=np.float32) * self.voxel_size
         zs = z0 + np.arange(nz, dtype=np.float32) * self.voxel_size
 
@@ -566,9 +559,7 @@ class ExcavatorMPM:
         builder.mpm_lambda = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
 
 
-    # ------------------------------------------------------------------
     # Simulation stepping / soil-contact scheduling
-    # ------------------------------------------------------------------
     def _clone_wp_array(self, arr):
         clone = wp.zeros_like(arr)
         clone.assign(arr)
@@ -596,7 +587,6 @@ class ExcavatorMPM:
             "mpm_state_particle_q": self._clone_wp_array(self.mpm_state.particle_q),
             "mpm_state_particle_qd": self._clone_wp_array(self.mpm_state.particle_qd),
             "collider_body_q": self._clone_wp_array(self.collider_body_q),
-            "collider_body_qd": self._clone_wp_array(self.collider_body_qd),
             "body_f_from_soil": self._clone_wp_array(self.body_f_from_soil),
             "body_f_from_soil_prev": self._clone_wp_array(self.body_f_from_soil_prev),
             "sim_time": float(self.sim_time),
@@ -623,7 +613,6 @@ class ExcavatorMPM:
         self.mpm_state.particle_q.assign(snapshot["mpm_state_particle_q"])
         self.mpm_state.particle_qd.assign(snapshot["mpm_state_particle_qd"])
         self.collider_body_q.assign(snapshot["collider_body_q"])
-        self.collider_body_qd.assign(snapshot["collider_body_qd"])
         self.body_f_from_soil.assign(snapshot["body_f_from_soil"])
         self.body_f_from_soil_prev.assign(snapshot["body_f_from_soil_prev"])
         self.sim_time = float(snapshot["sim_time"])
@@ -648,39 +637,33 @@ class ExcavatorMPM:
             self._restore_runtime_state(snapshot)
 
     def _copy_state_to_mpm_state(self) -> None:
-        
-        self.mpm_state.body_f = self.state_0.body_f
-        self.mpm_state.particle_q = self.state_0.particle_q
-        self.mpm_state.particle_qd = self.state_0.particle_qd
-        self.mpm_state.body_q = self.state_0.body_q
-        self.mpm_state.body_qd = self.state_0.body_qd
-        self.mpm_state.particle_f = self.state_0.particle_f
+        self.mpm_state.body_f.assign(self.state_0.body_f)
+        self.mpm_state.particle_q.assign(self.state_0.particle_q)
+        self.mpm_state.particle_qd.assign(self.state_0.particle_qd)
+        self.mpm_state.body_q.assign(self.state_0.body_q)
+        self.mpm_state.body_qd.assign(self.state_0.body_qd)
+        self.mpm_state.particle_f.assign(self.state_0.particle_f)
 
     def _copy_particles_from_mpm_state(self) -> None:
-        
-        self.state_0.particle_q = self.mpm_state.particle_q
-        self.state_0.particle_qd = self.mpm_state.particle_qd
-        self.state_0.particle_f = self.mpm_state.particle_f
+        self.state_0.particle_q.assign(self.mpm_state.particle_q)
+        self.state_0.particle_qd.assign(self.mpm_state.particle_qd)
+        self.state_0.particle_f.assign(self.mpm_state.particle_f)
 
 
     def _sync_mpm_collider_pose(self, source_state=None) -> None:
         source_state = self.state_0 if source_state is None else source_state
         self.collider_body_q.assign(source_state.body_q)
 
-    def _collect_collider_impulses(self, state) -> bool:
-        try:
-            collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver._collect_collider_impulses(state)
-        except Exception:
-            return False
+    def _collect_collider_impulses(self, state) -> None:
+        collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver.collect_collider_impulses(state)
 
         self.collider_impulse_ids.fill_(-1)
         n_colliders = min(collider_impulses.shape[0], self.collider_impulses.shape[0])
-        if n_colliders <= 0:
-            return False
+
         self.collider_impulses[:n_colliders].assign(collider_impulses[:n_colliders])
         self.collider_impulse_pos[:n_colliders].assign(collider_impulse_pos[:n_colliders])
         self.collider_impulse_ids[:n_colliders].assign(collider_impulse_ids[:n_colliders])
-        return True
+
 
     def _compute_soil_reaction_forces(self, dt_divisor: float) -> None:
         wp.launch(
@@ -736,8 +719,7 @@ class ExcavatorMPM:
             self.mpm_solver.step(self.mpm_state, self.mpm_state, contacts=None, control=None, dt=dt)
             for _ in range(self.fidelity.projections):
                 self.mpm_solver.project_outside(self.mpm_state, self.mpm_state, dt)
-            if self._collect_collider_impulses(self.mpm_state):
-                self._compute_soil_reaction_forces(dt_divisor)
+            self._compute_soil_reaction_forces(dt_divisor)
         self._copy_particles_from_mpm_state()
         self.body_f_from_soil_prev.assign(self.body_f_from_soil)
 
@@ -746,9 +728,7 @@ class ExcavatorMPM:
             self.simulate_rigid_substep(self.sim_dt, apply_viewer_forces=apply_viewer_forces)
             self.simulate_soil_substeps(self.mpm_substeps_per_rigid, self.mpm_dt)
 
-    # ------------------------------------------------------------------
     # Controller (kept mainly for the built-in digging demo)
-    # ------------------------------------------------------------------
     def apply_control(self) -> None:
         if self.control_size == 0:
             return
@@ -757,23 +737,14 @@ class ExcavatorMPM:
         
 
         if self.sim_time < self.settle_duration:
-            desired = DigPose(0.0, 0.55, 0.10, 0.55)
-
             desired_map = {
-                "swing": desired.swing,
-                "arm": desired.arm,
-                "stick": desired.stick,
-                "bucket": desired.bucket,
+                "swing": 0.0,
+                "arm": 0.55,
+                "stick": 0.10,
+                "bucket": 0.55,
             }
         else:
             desired_map = self._get_replay_desired_map(self.sim_time - self.settle_duration)
-
-        joint_vel_limit = {
-            "swing": 1.0,
-            "arm": 0.8,
-            "stick": 1.5,
-            "bucket": 3.0,
-        }
 
         q_prevs = self.state_0.joint_q.numpy()
 
@@ -781,10 +752,10 @@ class ExcavatorMPM:
             idx = self.joint_map[section]
 
             q_prev = q_prevs[idx]
-            dq_max = float(joint_vel_limit[section]) * self.frame_dt
+            dq_max = self.joint_vel_limit[section] * self.frame_dt
             q_cmd = desired_map[section]
             q_cmd = q_prev + np.clip(q_cmd - q_prev, -dq_max, dq_max)
-            # might choose to clip to behaviour range, but the model won't disobey them regardless
+            # might choose to clip to behaviour range, but the model won't obey them regardless
             q_cmd = desired_map[section]
             targets[idx] = q_cmd
 
@@ -801,9 +772,7 @@ class ExcavatorMPM:
 
         self.control.joint_target_pos.assign(targets)
 
-    # ------------------------------------------------------------------
     # Task metrics / main loop
-    # ------------------------------------------------------------------
     def count_particles_in_bucket(self) -> int:
         if self.model.particle_count == 0:
             return 0
