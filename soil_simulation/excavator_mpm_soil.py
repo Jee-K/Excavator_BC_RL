@@ -315,7 +315,7 @@ class ExcavatorMPM:
         # TODO
         # this replay information will need to be cut out, to some extent, somehow
         # likely, we'll replace this with an option to pass in a function
-        self.target_replay_path = Path("./bc_component/BC_dataset/dig/dig_2_bc_dataset.npz")
+        self.target_replay_path = Path("./bc_component/BC_dataset/swing/swing_3_bc_dataset.npz")
         self.target_replay_hz = 10.0
         self.target_replay_start_time_s = 0.0
         self.target_replay_states: Optional[np.ndarray] = None
@@ -744,6 +744,7 @@ class ExcavatorMPM:
                 "bucket": 0.55,
             }
         else:
+            # check if rotation is backwards???
             desired_map = self._get_replay_desired_map(self.sim_time - self.settle_duration)
 
         q_prevs = self.state_0.joint_q.numpy()
