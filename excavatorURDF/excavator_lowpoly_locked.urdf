@@ -542,7 +542,7 @@
 </inertial>
 </link>
 
-<link name="part04">
+<link name="bucketry">
 <visual>
 <origin xyz="0.059999999999999609201 0.14000000000000034639 0.054999999999999715783" rpy="-1.570796326794896558 -1.570796326794896558 0" />
 <geometry>
@@ -599,7 +599,7 @@
 <joint name="scoop1" type="revolute">
 <origin xyz="0.11999999999999966249 -1.5403327562575594989 -3.8857805861880478915e-16" rpy="3.1415926535897895633 -3.1950791765547316365e-15 -0.80531265657487949294" />
 <parent link="part03" />
-<child link="part04" />
+<child link="bucketry" />
 <axis xyz="0 0 1"/>
 <limit effort="10000" velocity="3" lower="-1.2217304763960306069" upper="0.87266462599716476678"/>
 <joint_properties friction="0.0"/>

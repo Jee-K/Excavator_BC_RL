@@ -1,468 +1,838 @@
 #!/usr/bin/env python3
 """
-Excavator MPM Soil Simulation
-Excavator digging in realistic MPM granular soil
-
-Based on Newton's ANYmal MPM example, adapted for excavator.
-
-Usage:
-    cd ~/Desktop/newton
-    ~/snap/code/220/.local/bin/uv run python excavator_mpm_soil.py
+Excavator + MPM soil simulation with necessary RL compromise.
 """
+# these aren't necessary, but they make it easier to read
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
+# necessaries
 import numpy as np
-import warp as wp
 
+# main simulation tools
+import warp as wp
 import newton
 import newton.examples
 from newton.solvers import SolverImplicitMPM
 
+@dataclass(frozen=True)
+class SoilProperties:
+    # material information
+    # mpm primaries
+    # density_kg_m3: float = 1800.0
+    # youngs_modulus_pa: float = 2.0e7
+    # poisson_ratio: float = 0.30
+    # friction_angle_deg: float = 32.0
+    # cohesion_pa: float = 12000.0
 
-class ExcavatorMPMExample:
-    def __init__(self, viewer, voxel_size=0.03, particles_per_cell=3):
-        # Simulation parameters
-        self.fps = 10
-        self.frame_dt = 1.0 / self.fps
-        self.sim_time = 0.0
-        self.sim_substeps = 20
-        self.sim_dt = self.frame_dt / self.sim_substeps
-        # ??? motivation to have more mpm substeps
+    # interface_friction_mu: float = 0.55
+
+    density_kg_m3: float = 1650.0
+    youngs_modulus_pa: float = 8.0e6
+    poisson_ratio: float = 0.28
+    friction_angle_deg: float = 32.0
+    cohesion_pa: float = 12_000.0
+    interface_friction_mu: float = 0.55
+    internal_friction_mu: float = .45
+
+@dataclass(frozen=True)
+class EnvironmentPreset:
+    # excavator information, rotation largely excluded
+    excavator_position: tuple[float, float, float] = (0.0, 3.0, 1.1)
+    excavator_platform_height_m: float = 0.6
+    excavator_platform_size: tuple[float, float] = (3.2, 2.4)
+
+    # this looks slightly better than the built-in ground in the rendered, even though they act the same
+    ground_size: tuple[float, float] = (15.0, 15.0)
+
+    # goal information
+    bucket_center: tuple[float, float, float] = (-4.0, 3.0, 0.0)
+    bucket_inner_half: tuple[float, float, float] = (0.75, 1.5, 0.8)
+    bucket_wall_thickness: float = 0.1
+
+    # spawn information
+    slope_angle_deg: float = 32.0
+    bank_height_m: float = 0.85
+    bank_width_m: float = 2.6
+    bank_length_m: float = 2.2
+    spawn_clearance_m: float = 0.025
+    bank_front_y: float = 1.10
+    bank_back_y: float = -1.10
+
+@dataclass(frozen=True)
+class SimulationFidelity:
+    voxel_size_m: float
+    rigid_substeps: int
+    mpm_iterations_per_rigid: int
+    rigid_ls_iterations: int
+    rigid_njmax: int # the values for this aren't particularly well motivated, but do fit precedent
+    fps: int
+    projections : int
+
+
+SIM_PRESETS: dict[str, SimulationFidelity] = {
+    "balanced": SimulationFidelity(
+        voxel_size_m=0.020,
+        rigid_substeps=6,
+        mpm_iterations_per_rigid=6,
+        rigid_ls_iterations=60,
+        rigid_njmax=260,
+        fps = 30,
+        projections = 2,
+    ),
+    "experimental": SimulationFidelity(
+        voxel_size_m=0.030,
+        rigid_substeps=3,
+        mpm_iterations_per_rigid=6,
+        rigid_ls_iterations=30,
+        rigid_njmax=260,
+        fps = 60,
+        projections = 1,
+    )
+}
+
+
+@wp.kernel
+def compute_body_forces_from_soil(
+    dt: float,
+    collider_ids: wp.array(dtype=int), # type: ignore
+    collider_impulses: wp.array(dtype=wp.vec3), # type: ignore
+    collider_impulse_pos: wp.array(dtype=wp.vec3), # type: ignore
+    body_ids: wp.array(dtype=int), # type: ignore
+    body_q: wp.array(dtype=wp.transform), # type: ignore
+    body_com: wp.array(dtype=wp.vec3), # type: ignore
+    body_f: wp.array(dtype=wp.spatial_vector), # type: ignore
+):
+    """Map MPM collider impulses into per-body spatial forces."""
+    i = wp.tid()
+    cid = collider_ids[i]
+    if cid >= 0 and cid < body_ids.shape[0]:
+        body_index = body_ids[cid]
+        if body_index == -1:
+            return
+        f_world = collider_impulses[i] / dt
+        x_wb = body_q[body_index]
+        x_com = body_com[body_index]
+        r = collider_impulse_pos[i] - wp.transform_point(x_wb, x_com)
+        wp.atomic_add(body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world)))
+
+
+@wp.kernel
+def subtract_body_force_from_velocity(
+    dt: float,
+    body_q: wp.array(dtype=wp.transform), # type: ignore
+    body_qd: wp.array(dtype=wp.spatial_vector), # type: ignore
+    body_f: wp.array(dtype=wp.spatial_vector), # type: ignore
+    body_inv_inertia: wp.array(dtype=wp.mat33), # type: ignore
+    body_inv_mass: wp.array(dtype=float), # type: ignore
+    body_q_res: wp.array(dtype=wp.transform), # type: ignore
+    body_qd_res: wp.array(dtype=wp.spatial_vector), # type: ignore
+):
+    """Remove previously applied soil-force contribution before the next MPM solve."""
+    body_id = wp.tid()
+    f = body_f[body_id]
+    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
+    r = wp.transform_get_rotation(body_q[body_id])
+    delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
+    body_q_res[body_id] = body_q[body_id]
+    body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
+
+
+@wp.kernel
+def add_spatial_force_inplace(
+    dst: wp.array(dtype=wp.spatial_vector), # type: ignore
+    src: wp.array(dtype=wp.spatial_vector), # type: ignore
+):
+    i = wp.tid()
+    dst[i] += src[i]
+
+
+class ExcavatorMPM:
+    def __init__(
+        self,
+        viewer: newton.viewer,
+        fidelity: SimulationFidelity,
+        enable_cuda_graph: bool = True,
+        debug: bool = False
+    ):
 
         self.viewer = viewer
         self.device = wp.get_device()
+        self.soil_info = SoilProperties()
+        self.env_info = EnvironmentPreset()
+        self.fidelity = fidelity
 
-        # Build the scene
+        self.debug = debug
+
+        self.voxel_size = self.fidelity.voxel_size_m
+
+        self.fps = self.fidelity.fps
+        self.frame_dt = 1.0 / self.fps
+        self.sim_time = 0.0
+        self.sim_substeps = self.fidelity.rigid_substeps
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.mpm_substeps_per_rigid = self.fidelity.mpm_iterations_per_rigid
+        self.mpm_dt = self.sim_dt / float(self.mpm_substeps_per_rigid)
+        self.enable_cuda_graph = bool(enable_cuda_graph)
+        self.score_print_interval = 5.0
+        self.last_score_print = 0.0
+        self.settle_duration = 0.5
+
+        self.coupled_graph = None
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Set default joint and shape properties for excavator
-        builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-            armature=0.1,
-            limit_ke=1.0e4,
-            limit_kd=1.0e2,
-        )
-        builder.default_shape_cfg.ke = 1.0e6  # 10x stiffer to prevent MPM particle penetration during fast motion
-        builder.default_shape_cfg.kd = 1.0e4  # Increased damping proportionally
-        builder.default_shape_cfg.kf = 1.0e3
-        builder.default_shape_cfg.mu = 0.7
+        # Apply rigid defaults before URDF import
+        self.configure_rigid_defaults(builder)
+        builder.default_shape_cfg.has_particle_collision = True
+        builder.default_shape_cfg.is_solid = True
 
-        # Register MPM custom attributes before adding particles
+        # Reusable explicit configs for static/proxy geoms added outside the URDF.
+        self.static_particle_contact_cfg = newton.ModelBuilder.ShapeConfig(
+            ke=1.0e6,
+            kd=1.0e4,
+            kf=1.0e3,
+            mu=self.soil_info.interface_friction_mu,
+            density=0.0,
+            has_particle_collision=True,
+            is_solid=True,
+        )
+
+        self.static_ground_cfg = newton.ModelBuilder.ShapeConfig(
+            mu=0.60,
+            density=0.0,
+            has_particle_collision=True,
+            is_solid=True,
+        )
+
         SolverImplicitMPM.register_custom_attributes(builder)
 
-        # Load excavator URDF
-        # Use relative path from this script's directory
-
-        # Load excavator URDF
-        excavator_urdf = "./excavatorURDF/excavator_boxy.urdf"
+        excavator_urdf = "./excavatorURDF/excavator_lowpoly_locked_splitbucket.urdf"
         print(f"Loading excavator from: {excavator_urdf}")
-        
-        # Position excavator at the side of soil pile so it can reach in
-        # Soil is centered at origin, 4m x 4m, so excavator at x=-3.0 is at the edge
-        # Set position control gains for each excavator joint (like ANYmal example)
-        # Using much higher gains for heavy excavator
-        # Correctly determine control slot range for gains (skip root DOFs)
+
         control_start = len(builder.joint_target_ke)
-        # After add_urdf, record control end
         builder.add_urdf(
             excavator_urdf,
-            xform=wp.transform(wp.vec3(0.0, 3.0, 0.5), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(*self.env_info.excavator_position), wp.quat_identity()),
             floating=True,
             enable_self_collisions=False,
             collapse_fixed_joints=True,
             ignore_inertial_definitions=False,
         )
-        control_end = len(builder.joint_target_ke)
-        print(f"[INFO] Control range for excavator: {control_start} → {control_end}")
+        control_end = len(builder.joint_target_ke)        
 
-        # Apply gains only to actual control slots (not floating base)
-        # these values intended to be quite high
+        # Limit mpm collisions to only the portions we expect to be relevant. 
+        # The actual performance impact of this is debatable
+        for body in range(builder.body_count):
+            if "bucketry" not in builder.body_key[body]: 
+                for shape in builder.body_shapes[body]:
+                    builder.shape_flags[shape] = builder.shape_flags[shape] & ~newton.ShapeFlags.COLLIDE_PARTICLES
+
+        # control gains
         for i in range(control_start, control_end):
-            builder.joint_target_ke[i] = 5000.0 # we could choose to make these *extremely* high and rely on urdf values
+            builder.joint_target_ke[i] = 5000.0
             builder.joint_target_kd[i] = 500.0
-        builder.joint_target_ke[8] = 15000.0 # artificially increase boom gain, since it seems to be struggling
+        builder.joint_target_ke[7] = 50000 # back boom needs some help
 
-        # Create MPM soil terrain
-        print("Creating MPM soil terrain...")
-        self.create_mpm_soil(builder, voxel_size, particles_per_cell)
+        self.create_mpm_soil_bank(builder)
+        self.add_ground_plane(builder)
+        self.add_excavator_platform(builder)
 
-        # Add ground plane for collision
-        builder.add_shape_plane(
-            body=-1,
-            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, density=0.0),
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-            width=20.0,
-            length=20.0,
-        )
-
-        # Add dump bucket (goal area)
-        # Excavator is at (0, 3, 0.5) facing soil at origin.
-        # Bucket is to the side of the excavator so it can swing and dump.
-        self.bucket_center = np.array([-4.0, 3.0, 0.0])
-        self.bucket_inner_half = np.array([0.75, 1.5, 0.8])  # 1.5m x 1.5m x 1.6m inner
+        self.bucket_center = np.asarray(self.env_info.bucket_center, dtype=np.float64)
+        self.bucket_inner_half = np.asarray(self.env_info.bucket_inner_half, dtype=np.float64)
         self.add_dump_bucket(builder)
 
-        # Finalize model
         self.model = builder.finalize()
-        self.model.gravity.assign(wp.array([wp.vec3(0.0, 0.0, -9.81)], dtype=wp.vec3))
+        # configure particle contact material
+        self.model.particle_mu = self.soil_info.internal_friction_mu # particle-particle
+        self.model.particle_ke = self.soil_info.youngs_modulus_pa
 
-        # Print joint information
-        print(f"\nExcavator has {self.model.joint_count} joints:")
+        self.bucket_body_index = self.model.body_key.index('bucketry')
 
-        # Convert arrays to numpy for indexing
-        joint_types = self.model.joint_type.numpy() if hasattr(self.model, 'joint_type') else None
-        joint_lower = self.model.joint_limit_lower.numpy() if hasattr(self.model, 'joint_limit_lower') else None
-        joint_upper = self.model.joint_limit_upper.numpy() if hasattr(self.model, 'joint_limit_upper') else None
-
-        print(joint_types, joint_lower, joint_upper)
-
-        joint_names = []
-        # TODO: fix all this
-        for i in range(self.model.joint_count):
-            # works for this setup, at least
-            name = self.model.joint_name[i] if hasattr(self.model, 'joint_name') else f"joint_{i}"
-            joint_names.append(name)
-
-            # Get joint info
-            jtype = joint_types[i] if joint_types is not None else -1
-            lower = joint_lower[i] if joint_lower is not None else 0.0
-            upper = joint_upper[i] if joint_upper is not None else 0.0
-
-            print(f"  [{i}] {name:20s} type={jtype} limits=[{lower:.3f}, {upper:.3f}]")
-
-        # MPM solver options
         mpm_options = SolverImplicitMPM.Options()
-        mpm_options.voxel_size = voxel_size
+        mpm_options.voxel_size = self.voxel_size
         mpm_options.tolerance = 1.0e-5
-        mpm_options.transfer_scheme = "pic" # ???
-        mpm_options.grid_type = "sparse"  # "sparse" or "fixed"
+        mpm_options.transfer_scheme = "pic"
+        mpm_options.grid_type = "sparse" # !!! we want fixed if we plan to use graphs
         mpm_options.strain_basis = "P0"
         mpm_options.max_iterations = 50
         mpm_options.critical_fraction = 0.0
+        mpm_options.air_drag = 0.5
+        mpm_options.collider_basis = "Q1" # big alt is P0
+        mpm_options.collider_velocity_mode = "finite_difference"
 
-        # Initialize MuJoCo solver for excavator rigid body dynamics
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
-            ls_iterations=50,
-            njmax=200,  # Increased to handle contact constraints
+            ls_iterations=self.fidelity.rigid_ls_iterations,
+            njmax=self.fidelity.rigid_njmax,
+            ccd_iterations = 60,
         )
 
-        # Initialize MPM solver for soil
         self.mpm_solver = SolverImplicitMPM(self.model, mpm_options)
 
-        # Configure collider: treat excavator bodies as kinematic
-        self.mpm_solver.setup_collider(
-            body_mass=wp.zeros_like(self.model.body_mass),
-        )
-
-        # Simulation state
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-
-        # Initialize forward kinematics
+        self.mpm_state = self.model.state()
+        self.mpm_state.body_q = wp.empty_like(self.state_0.body_q)
+        self.mpm_state.body_qd = wp.empty_like(self.state_0.body_qd)
+        self.mpm_state.body_f = wp.empty_like(self.state_0.body_f)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        self._copy_state_to_mpm_state()
 
-        # Control setup
+        # Collider buffer for the MPM contact path.
+        self.collider_body_q = wp.zeros_like(self.state_0.body_q)
+        self.collider_body_q.assign(self.state_0.body_q)
+        self.mpm_solver.setup_collider(
+            model=self.model,
+            body_mass=wp.zeros_like(self.model.body_mass),
+            body_q=self.collider_body_q,
+        )
+
+        # Two-way coupling buffers (adapted from Newton's mpm_twoway_coupling example).
+        max_nodes = 1 << 20
+        self.collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
+        self.collider_impulse_pos = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
+        self.collider_impulse_ids = wp.full(max_nodes, value=-1, dtype=int, device=self.model.device)
+        self.collider_body_id = self.mpm_solver.collider_body_index
+        self.body_f_from_soil = wp.zeros_like(self.state_0.body_f)
+        self.body_f_from_soil_prev = wp.zeros_like(self.state_0.body_f)
+        self._zero_body_force = wp.zeros_like(self.state_0.body_f)
+        self._collect_collider_impulses(self.mpm_state)
+
         self.control = self.model.control()
         self._joint_target_host = self.control.joint_target_pos.numpy()
+        self.control_size = int(self._joint_target_host.shape[0])
 
-        print(f"\nControl gains (set per joint on builder):")
-        print(f"  joint_target_ke: 5000.0")
-        print(f"  joint_target_kd: 500.0")
+        self.control_lower, self.control_upper = self.model.joint_limit_lower, self.model.joint_limit_upper
+        self.joint_map = {"swing": 6, "arm":7, "stick":8, "bucket":9}
+        self.joint_vel_limit = {
+            "swing": 1.0,
+            "arm": 0.8,
+            "stick": 1.5,
+            "bucket": 3.0,
+        }
 
-        # Score tracking
+        # TODO
+        # this replay information will need to be cut out, to some extent, somehow
+        # likely, we'll replace this with an option to pass in a function
+        self.target_replay_path = Path("./bc_component/BC_dataset/swing/swing_3_bc_dataset.npz")
+        self.target_replay_hz = 10.0
+        self.target_replay_start_time_s = 0.0
+        self.target_replay_states: Optional[np.ndarray] = None
+        self.target_replay_key: Optional[str] = None
+        self._load_target_state_replay()
+
+        self.total_particles = int(self.model.particle_count)
         self.particles_in_bucket = 0
-        self.total_particles = self.model.particle_count
-        self.score_print_interval = 5.0  # print score every 5 sim seconds
-        self.last_score_print = 0.0
 
-        # Set viewer
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
+        self.viewer.show_visual = False
+        self.viewer.show_collision = True
+        self.viewer.show_triangles = False # corresponds to the cloth option
 
-        # CUDA graph capture for speed
-        self.capture()
+        # self.capture() # !!!
 
-        print("\n" + "="*60)
-        print("EXCAVATOR MPM SIMULATION")
-        print("="*60)
-        print("Controls:")
-        print("  Press SPACE to start/stop")
-        print("  Excavator joints can be controlled via code (see apply_control)")
-        print(f"\nGoal: Move soil into the dump bucket at ({self.bucket_center[0]:.0f}, {self.bucket_center[1]:.0f}, 0)")
-        print(f"  Bucket size: {self.bucket_inner_half[0]*2:.1f}m x {self.bucket_inner_half[1]*2:.1f}m")
-        print(f"  Total soil particles: {self.total_particles:,}")
-        print("="*60)
+    # Target-state replay inputs
+    @staticmethod
+    def _select_numeric_array_from_npz(data: np.lib.npyio.NpzFile) -> tuple[str, np.ndarray]:
+        preferred_keys = ("target_states", "states", "targets", "target", "arr_0")
+        for key in preferred_keys:
+            if key in data.files:
+                arr = np.asarray(data[key])
+                if np.issubdtype(arr.dtype, np.number):
+                    return key, arr
+        for key in data.files:
+            arr = np.asarray(data[key])
+            if np.issubdtype(arr.dtype, np.number):
+                return key, arr
+        raise ValueError("No numeric arrays found in target-state npz file.")
 
-    def add_dump_bucket(self, builder):
-        """Add a static dump bucket (goal area) to the scene.
+    def _load_target_state_replay(self) -> None:
+        self.target_replay_active = False
+        if not self.target_replay_path:
+            print(
+                "Target-state replay disabled. Place target_angles.npz next to this Python file to drive the excavator from a 10 Hz target-state file."
+            )
+            return
 
-        Bucket is an open-top box made of 5 box shapes (bottom + 4 walls).
-        Positioned to the left of the excavator so it can swing and dump.
-        """
-        bx, by, bz = self.bucket_center
-        iw, il, idepth = self.bucket_inner_half  # inner half-extents
-        T = 0.1  # wall thickness
+        try:
+            with np.load(self.target_replay_path, allow_pickle=False) as data:
+                key, states = self._select_numeric_array_from_npz(data)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load target-state replay file '{self.target_replay_path.name}': {exc}")
 
-        cfg = newton.ModelBuilder.ShapeConfig(
-            ke=1.0e5, kd=1.0e3, kf=1.0e3, mu=0.6, density=0.0
+        states = np.asarray(states, dtype=np.float64)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        if states.ndim != 2:
+            print(
+                f"Target-state replay file must contain a 2D array [T, D], but got shape {states.shape}."
+            )
+            return
+
+        self.target_replay_states = states
+        self.target_replay_key = key
+
+        # hardcoded, but checked
+        assert states.shape[1] == 4
+        
+        self.target_replay_active = bool(states.shape[0] > 0)
+
+        duration_s = 0.0
+        if states.shape[0] > 1 and self.target_replay_hz > 0.0:
+            duration_s = float(states.shape[0] - 1) / float(self.target_replay_hz)
+        print(
+            "Loaded target-state replay:",
+            f"file={self.target_replay_path.name}",
+            f"array={key}",
+            f"hz={self.target_replay_hz:.3f}",
+            f"duration_s={duration_s:.3f}",
         )
 
-        # Bottom plate
+    def _get_replay_desired_map(self, time: float) -> Optional[dict[str, float]]:
+        states = self.target_replay_states
+
+        replay_sample = time * float(self.target_replay_hz)
+
+        replay_sample = np.clip(replay_sample, 0.0, states.shape[0] - 1)
+        row = states[int(np.floor(replay_sample))]
+
+        # ??? interpolate
+
+        return {
+            "swing": float(row[0]) - 2, # TODO: this value often needs modification to be placed into reasonable locations, hence the -2 here
+            "arm": float(row[1]),
+            "stick": float(row[2]),
+            "bucket": float(row[3]),
+        }
+
+    # Scene and material setup
+    def configure_rigid_defaults(self, builder) -> None:
+        builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
+            armature=0.05,
+            limit_ke=2.0e4,
+            limit_kd=2.0e2,
+        )
+        builder.default_shape_cfg.ke = 1.0e6
+        builder.default_shape_cfg.kd = 1.0e4
+        builder.default_shape_cfg.kf = 1.0e3
+        builder.default_shape_cfg.mu = self.soil_info.interface_friction_mu
+
+    def add_ground_plane(self, builder) -> None:
+        width, length = self.env_info.ground_size
+        builder.add_shape_plane(
+            body=-1,
+            cfg=self.static_ground_cfg,
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            width=width,
+            length=length,
+        )
+
+    def add_excavator_platform(self, builder) -> None:
+        width, length = self.env_info.excavator_platform_size
+        height = self.env_info.excavator_platform_height_m
+        if height <= 0.0:
+            return
+
+        ex, ey, _ = self.env_info.excavator_position
         builder.add_shape_box(
-            body=-1, cfg=cfg,
-            xform=wp.transform(wp.vec3(bx, by, bz + T * 0.5), wp.quat_identity()),
-            hx=iw + T, hy=il + T, hz=T * 0.5,
-        )
-        # Front wall  (negative Y)
-        builder.add_shape_box(
-            body=-1, cfg=cfg,
-            xform=wp.transform(wp.vec3(bx, by - il - T * 0.5, bz + T + idepth * 0.5), wp.quat_identity()),
-            hx=iw + T, hy=T * 0.5, hz=idepth * 0.5,
-        )
-        # Back wall (positive Y)
-        builder.add_shape_box(
-            body=-1, cfg=cfg,
-            xform=wp.transform(wp.vec3(bx, by + il + T * 0.5, bz + T + idepth * 0.5), wp.quat_identity()),
-            hx=iw + T, hy=T * 0.5, hz=idepth * 0.5,
-        )
-        # Left wall (negative X)
-        builder.add_shape_box(
-            body=-1, cfg=cfg,
-            xform=wp.transform(wp.vec3(bx - iw - T * 0.5, by, bz + T + idepth * 0.5), wp.quat_identity()),
-            hx=T * 0.5, hy=il, hz=idepth * 0.5,
-        )
-        # Right wall (positive X)
-        builder.add_shape_box(
-            body=-1, cfg=cfg,
-            xform=wp.transform(wp.vec3(bx + iw + T * 0.5, by, bz + T + idepth * 0.5), wp.quat_identity()),
-            hx=T * 0.5, hy=il, hz=idepth * 0.5,
+            body=-1,
+            cfg=self.static_ground_cfg,
+            xform=wp.transform(wp.vec3(ex, ey, 0.5 * height), wp.quat_identity()),
+            hx=0.5 * width,
+            hy=0.5 * length,
+            hz=0.5 * height,
         )
 
-        print(f"\nDump bucket added:")
-        print(f"  Center: ({bx}, {by}, {bz})")
-        print(f"  Inner size: {iw*2:.1f}m x {il*2:.1f}m x {idepth*2:.1f}m")
-        print(f"  Goal: swing excavator left and dump soil into bucket")
-
-    def count_particles_in_bucket(self):
-        """Count MPM particles currently inside the dump bucket volume."""
-        if self.model.particle_count == 0:
-            return 0
-
-        positions = self.state_0.particle_q.numpy()  # shape: [N, 3]
-
+    def add_dump_bucket(self, builder) -> None:
         bx, by, bz = self.bucket_center
         iw, il, idepth = self.bucket_inner_half
-        T = 0.1
+        t = self.env_info.bucket_wall_thickness
+        cfg = self.static_particle_contact_cfg
 
-        # Inner bounding box of the bucket
-        x_min, x_max = bx - iw, bx + iw
-        y_min, y_max = by - il, by + il
-        z_min, z_max = bz + T, bz + T + idepth * 2
-
-        inside = (
-            (positions[:, 0] >= x_min) & (positions[:, 0] <= x_max) &
-            (positions[:, 1] >= y_min) & (positions[:, 1] <= y_max) &
-            (positions[:, 2] >= z_min) & (positions[:, 2] <= z_max)
+        builder.add_shape_box(
+            body=-1,
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(bx, by, bz + 0.5 * t), wp.quat_identity()),
+            hx=iw + t,
+            hy=il + t,
+            hz=0.5 * t,
         )
-        return int(np.count_nonzero(inside))
+        builder.add_shape_box(
+            body=-1,
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(bx, by - il - 0.5 * t, bz + t + 0.5 * idepth), wp.quat_identity()),
+            hx=iw + t,
+            hy=0.5 * t,
+            hz=0.5 * idepth,
+        )
+        builder.add_shape_box(
+            body=-1,
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(bx, by + il + 0.5 * t, bz + t + 0.5 * idepth), wp.quat_identity()),
+            hx=iw + t,
+            hy=0.5 * t,
+            hz=0.5 * idepth,
+        )
+        builder.add_shape_box(
+            body=-1,
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(bx - iw - 0.5 * t, by, bz + t + 0.5 * idepth), wp.quat_identity()),
+            hx=0.5 * t,
+            hy=il,
+            hz=0.5 * idepth,
+        )
+        builder.add_shape_box(
+            body=-1,
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(bx + iw + 0.5 * t, by, bz + t + 0.5 * idepth), wp.quat_identity()),
+            hx=0.5 * t,
+            hy=il,
+            hz=0.5 * idepth,
+        )
 
-    def create_mpm_soil(self, builder, voxel_size, particles_per_cell):
-        soil_width = 2.0
-        soil_length = 2.0
-        soil_height = 0.8
+    # ??? consider using some of these values to improve simulation
+    # def _compute_native_mpm_material_arrays(self) -> dict[str, np.ndarray]:
+    #     particle_count = int(self.model.particle_count)
+    #     phi = np.radians(self.soil_info.friction_angle_deg)
+    #     # Currently biases the built-in material toward dry, frictional bulk behavior.
+    #     # In the low-memory regime, extra apparent cohesion and any non-trivial
+    #     # tensile support show up visually as sticky clumping.
+    #     friction = float(1.10 * np.tan(phi))
+    #     cohesion = float(0.25 * self.soil_info.cohesion_pa)
+    #     yield_pressure = max(cohesion / max(friction, 1.0e-3), 5.0e2)
+    #     yield_stress = max(np.sqrt(3.0) * cohesion, 5.0e2)
+    #     hardening = 0.0
+    #     tensile_yield_ratio = float(self.native_mpm.tensile_yield_ratio)
+    #     return {
+    #         "yield_pressure": np.full(particle_count, yield_pressure, dtype=np.float32),
+    #         "yield_stress": np.full(particle_count, yield_stress, dtype=np.float32),
+    #         "tensile_yield_ratio": np.full(particle_count, tensile_yield_ratio, dtype=np.float32),
+    #         "friction": np.full(particle_count, friction, dtype=np.float32),
+    #         "hardening": np.full(particle_count, hardening, dtype=np.float32),
+    #     }
 
-        nx = int(round(soil_width / voxel_size))
-        ny = int(round(soil_length / voxel_size))
-        nz = int(round(soil_height / voxel_size))
+    def create_mpm_soil_bank(self, builder : newton.ModelBuilder) -> None:
+        y_front = self.env_info.bank_front_y
+        y_back = self.env_info.bank_back_y
+        max_height = self.env_info.bank_height_m
+        z0 = self.env_info.spawn_clearance_m
+        slope_tan = np.tan(np.radians(self.env_info.slope_angle_deg))
 
-        density = 1800.0
-        particle_mass = density * (voxel_size ** 3) / particles_per_cell
+        nx = int(np.ceil(self.env_info.bank_width_m / self.voxel_size))
+        ny = int(np.ceil(self.env_info.bank_length_m / self.voxel_size))
+        nz = int(np.ceil((max_height + z0 + self.voxel_size) / self.voxel_size))
 
-        # Build voxel origins in a vectorized way
-        xs = -soil_width / 2 + np.arange(nx, dtype=np.float32) * voxel_size
-        ys = -soil_length / 2 + np.arange(ny, dtype=np.float32) * voxel_size
-        zs = 0.05 + np.arange(nz, dtype=np.float32) * voxel_size
+        xs = -0.5 * self.env_info.bank_width_m + np.arange(nx, dtype=np.float32) * self.voxel_size
+        ys = y_back + np.arange(ny, dtype=np.float32) * self.voxel_size
+        zs = z0 + np.arange(nz, dtype=np.float32) * self.voxel_size
 
-        grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
-        n_cells = grid.shape[0]
+        cell_origins = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+        depth_into_bank = np.maximum(0.0, y_front - cell_origins[:, 1])
+        local_height = np.minimum(max_height, depth_into_bank * slope_tan)
+        occupancy_mask = (
+            (cell_origins[:, 1] >= y_back)
+            & (cell_origins[:, 1] <= y_front)
+            & (cell_origins[:, 2] <= z0 + local_height)
+        )
+        occupied_cells = cell_origins[occupancy_mask].astype(np.float32, copy=False)
 
-        # Vectorized jitter for all particles
-        rng = np.random.default_rng(42)
-        jitter = rng.random((n_cells, particles_per_cell, 3), dtype=np.float32) * voxel_size
-        positions = (grid[:, None, :] + jitter).reshape(-1, 3)
+        rng = np.random.default_rng(7)
+        jitter = rng.random((occupied_cells.shape[0], 1, 3), dtype=np.float32) * self.voxel_size
+        positions = (occupied_cells[:, None, :] + jitter).reshape(-1, 3)
 
-        zero_vel = wp.vec3(0.0, 0.0, 0.0)
+        particle_mass = self.soil_info.density_kg_m3 * ((self.voxel_size / 2)** 3) * 4/3 * np.pi
         for p in positions:
             builder.add_particle(
                 pos=wp.vec3(float(p[0]), float(p[1]), float(p[2])),
-                vel=zero_vel,
+                vel=wp.vec3(0.0),
                 mass=particle_mass,
+                radius=self.voxel_size / 2,
             )
 
-        # Elastic material
-        E = 20e6
-        nu = 0.4
-        builder.mpm_E = E
+        e = self.soil_info.youngs_modulus_pa
+        nu = self.soil_info.poisson_ratio
+        builder.mpm_E = e
         builder.mpm_nu = nu
-        builder.mpm_mu = E / (2 * (1 + nu))
-        builder.mpm_lambda = E * nu / ((1 + nu) * (1 - 2 * nu))
+        builder.mpm_mu = e / (2.0 * (1.0 + nu))
+        builder.mpm_lambda = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
 
-        print(f"Soil properties:")
-        # print(f"  Young's modulus: {youngs_modulus/1e6:.1f} MPa")
-        # print(f"  Poisson's ratio: {poissons_ratio}")
-        print(f"  Density: {density} kg/m³")
-        # print(f"  Friction angle: {friction_angle}°")
-        # print(f"  Cohesion: {cohesion/1000:.1f} kPa")
 
-    def capture(self):
-        """Capture CUDA graphs for performance"""
-        self.excavator_graph = None
-        self.sand_graph = None
+    # Simulation stepping / soil-contact scheduling
+    def _clone_wp_array(self, arr):
+        clone = wp.zeros_like(arr)
+        clone.assign(arr)
+        return clone
 
-        if wp.get_device().is_cuda:
-            # Capture excavator simulation
-            with wp.ScopedCapture() as capture:
-                self.simulate_excavator()
-            self.excavator_graph = capture.graph
+    def _snapshot_runtime_state(self) -> dict[str, object]:
+        return {
+            "state_0_joint_q": self._clone_wp_array(self.state_0.joint_q),
+            "state_0_joint_qd": self._clone_wp_array(self.state_0.joint_qd),
+            "state_0_body_q": self._clone_wp_array(self.state_0.body_q),
+            "state_0_body_qd": self._clone_wp_array(self.state_0.body_qd),
+            "state_0_body_f": self._clone_wp_array(self.state_0.body_f),
+            "state_0_particle_q": self._clone_wp_array(self.state_0.particle_q),
+            "state_0_particle_qd": self._clone_wp_array(self.state_0.particle_qd),
+            "state_1_joint_q": self._clone_wp_array(self.state_1.joint_q),
+            "state_1_joint_qd": self._clone_wp_array(self.state_1.joint_qd),
+            "state_1_body_q": self._clone_wp_array(self.state_1.body_q),
+            "state_1_body_qd": self._clone_wp_array(self.state_1.body_qd),
+            "state_1_body_f": self._clone_wp_array(self.state_1.body_f),
+            "state_1_particle_q": self._clone_wp_array(self.state_1.particle_q),
+            "state_1_particle_qd": self._clone_wp_array(self.state_1.particle_qd),
+            "mpm_state_body_q": self._clone_wp_array(self.mpm_state.body_q),
+            "mpm_state_body_qd": self._clone_wp_array(self.mpm_state.body_qd),
+            "mpm_state_body_f": self._clone_wp_array(self.mpm_state.body_f),
+            "mpm_state_particle_q": self._clone_wp_array(self.mpm_state.particle_q),
+            "mpm_state_particle_qd": self._clone_wp_array(self.mpm_state.particle_qd),
+            "collider_body_q": self._clone_wp_array(self.collider_body_q),
+            "body_f_from_soil": self._clone_wp_array(self.body_f_from_soil),
+            "body_f_from_soil_prev": self._clone_wp_array(self.body_f_from_soil_prev),
+            "sim_time": float(self.sim_time),
+        }
 
-            # Capture sand simulation (if using fixed grid)
-            if self.mpm_solver.grid_type == "fixed":
-                with wp.ScopedCapture() as capture:
-                    self.simulate_sand()
-                self.sand_graph = capture.graph
+    def _restore_runtime_state(self, snapshot: dict[str, object]) -> None:
+        self.state_0.joint_q.assign(snapshot["state_0_joint_q"])
+        self.state_0.joint_qd.assign(snapshot["state_0_joint_qd"])
+        self.state_0.body_q.assign(snapshot["state_0_body_q"])
+        self.state_0.body_qd.assign(snapshot["state_0_body_qd"])
+        self.state_0.body_f.assign(snapshot["state_0_body_f"])
+        self.state_0.particle_q.assign(snapshot["state_0_particle_q"])
+        self.state_0.particle_qd.assign(snapshot["state_0_particle_qd"])
+        self.state_1.joint_q.assign(snapshot["state_1_joint_q"])
+        self.state_1.joint_qd.assign(snapshot["state_1_joint_qd"])
+        self.state_1.body_q.assign(snapshot["state_1_body_q"])
+        self.state_1.body_qd.assign(snapshot["state_1_body_qd"])
+        self.state_1.body_f.assign(snapshot["state_1_body_f"])
+        self.state_1.particle_q.assign(snapshot["state_1_particle_q"])
+        self.state_1.particle_qd.assign(snapshot["state_1_particle_qd"])
+        self.mpm_state.body_q.assign(snapshot["mpm_state_body_q"])
+        self.mpm_state.body_qd.assign(snapshot["mpm_state_body_qd"])
+        self.mpm_state.body_f.assign(snapshot["mpm_state_body_f"])
+        self.mpm_state.particle_q.assign(snapshot["mpm_state_particle_q"])
+        self.mpm_state.particle_qd.assign(snapshot["mpm_state_particle_qd"])
+        self.collider_body_q.assign(snapshot["collider_body_q"])
+        self.body_f_from_soil.assign(snapshot["body_f_from_soil"])
+        self.body_f_from_soil_prev.assign(snapshot["body_f_from_soil_prev"])
+        self.sim_time = float(snapshot["sim_time"])
 
-    def simulate_excavator(self):
-        """Simulate excavator rigid body dynamics"""
-        for _ in range(self.sim_substeps):
-            self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
-            self.solver.step(self.state_0, self.state_1, self.control, contacts=None, dt=self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-
-    def simulate_sand(self):
-        """Simulate MPM sand physics"""
-        mpm_bonus_factor = 2 # giving it a bonus for particle simulation
-        mpm_dt = self.sim_dt / mpm_bonus_factor
-        for _ in range(self.sim_substeps * mpm_bonus_factor): 
-            self.mpm_solver.step(self.state_0, self.state_1, None, None, mpm_dt)
-            self.mpm_solver.project_outside(self.state_1, self.state_1, mpm_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-
-    def apply_control(self):
-        """Apply control to excavator joints
-
-        Modify this function to control the excavator.
-        Sets target positions for joint position control.
-        """
-        current_pos = self.state_0.joint_q.numpy()
-        pos = self._joint_target_host
-
-        if pos.shape[0] < 4:
+    def capture(self) -> None:
+        if not self.enable_cuda_graph:
             return
 
-        t = self.sim_time
-        # in robot_fixed_alternate
-        # grounded versions, +1 for float:
-        # 0 - base, left then right
-        # 1 - front left-right rotator, right then left
-        # 2 - back arm, down then up # you really have to exceed the real limit to achieve this, something like -3.5 is necessary to get a hover
-        # 3 - middle arm, outwards then inwards # 0.8 usually hovers at full extension
-        # 4 - bucket, tight then open
+        snapshot = self._snapshot_runtime_state()
+        try:
+            with wp.ScopedCapture(device=self.device) as capture:
+                self.simulate_coupled_frame_fixed(apply_viewer_forces=False)
+            self.coupled_graph = capture.graph
+            print(
+                "Captured fixed-ratio CUDA graph: "
+                f"rigid_substeps={self.sim_substeps}, mpm_substeps_per_rigid={self.mpm_substeps_per_rigid}"
+            )
+        except Exception as exc:
+            self.coupled_graph = None
+            print(f"CUDA graph capture unavailable for this configuration: {exc}")
+        finally:
+            self._restore_runtime_state(snapshot)
 
-        # in robot_fixed_alternate and ungrounded
-        # 0 - x
-        # 1 - y
-        # 2 - z
-        # 3-6 - quaternion related partwise-rotation nonsense
-        # 7 - base
-        # 8 - front l/r rotator
-        # 9 - back arm
-        # 10 - middle arm
-        # 11 - bucket
+    def _copy_state_to_mpm_state(self) -> None:
+        self.mpm_state.body_f.assign(self.state_0.body_f)
+        self.mpm_state.particle_q.assign(self.state_0.particle_q)
+        self.mpm_state.particle_qd.assign(self.state_0.particle_qd)
+        self.mpm_state.body_q.assign(self.state_0.body_q)
+        self.mpm_state.body_qd.assign(self.state_0.body_qd)
+        self.mpm_state.particle_f.assign(self.state_0.particle_f)
 
-        # new scheme of loading joints for alt ungrounded
-        # 6 - base rotator?
-        # 7 - front left-right rotator
-        # 8 - back arm
-        # 9 - middle arm
-        # 10 - bucket
+    def _copy_particles_from_mpm_state(self) -> None:
+        self.state_0.particle_q.assign(self.mpm_state.particle_q)
+        self.state_0.particle_qd.assign(self.mpm_state.particle_qd)
+        self.state_0.particle_f.assign(self.mpm_state.particle_f)
 
-        # pos[2] = .5
-        pos[6] = 0
-        pos[7] = 0
-        pos[8] = -.5-np.sin(t / 5)
-        pos[9] = -np.sin(t / 3)
-        pos[10] = 5
-        # pos[10] = 10
-        # pos[6] = t
-        # pos[6] = 10 * np.sin(t / 2)
 
-        self.control.joint_target_pos.assign(pos)
+    def _sync_mpm_collider_pose(self, source_state=None) -> None:
+        source_state = self.state_0 if source_state is None else source_state
+        self.collider_body_q.assign(source_state.body_q)
 
-        # Debug output every 2 seconds
-        if int(t) % 2 == 0 and t - int(t) < self.frame_dt:
-            
-            print(pos, current_pos)
-            print(f"\n[t={t:.1f}s] Control Debug:")
-            
-            print(f"  Target pos:          [{', '.join([format(float(x), '6.3f') for x in pos])}]")
-            print(f"  Current pos: [{', '.join([format(float(x), '6.3f') for x in current_pos])}]")
+    def _collect_collider_impulses(self, state) -> None:
+        collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver.collect_collider_impulses(state)
 
-    def step(self):
-        """Step the simulation forward"""
-        # Apply control
+        self.collider_impulse_ids.fill_(-1)
+        n_colliders = min(collider_impulses.shape[0], self.collider_impulses.shape[0])
+
+        self.collider_impulses[:n_colliders].assign(collider_impulses[:n_colliders])
+        self.collider_impulse_pos[:n_colliders].assign(collider_impulse_pos[:n_colliders])
+        self.collider_impulse_ids[:n_colliders].assign(collider_impulse_ids[:n_colliders])
+
+
+    def _compute_soil_reaction_forces(self, dt_divisor: float) -> None:
+        wp.launch(
+            compute_body_forces_from_soil,
+            dim=self.collider_impulse_ids.shape[0],
+            inputs=[
+                float(max(dt_divisor, 1.0e-6)),
+                self.collider_impulse_ids,
+                self.collider_impulses,
+                self.collider_impulse_pos,
+                self.collider_body_id,
+                self.state_0.body_q,
+                self.model.body_com,
+                self.body_f_from_soil,
+            ],
+        )
+
+    def simulate_rigid_substep(self, dt: float, apply_viewer_forces: bool = True) -> None:
+        self.state_0.clear_forces()
+        if apply_viewer_forces:
+            self.viewer.apply_forces(self.state_0)
+        wp.launch(
+            add_spatial_force_inplace,
+            dim=self.state_0.body_q.shape,
+            inputs=[self.state_0.body_f, self.body_f_from_soil_prev],
+        )
+        self.solver.step(self.state_0, self.state_1, self.control, contacts=None, dt=dt)
+        self.state_0, self.state_1 = self.state_1, self.state_0
+        self._sync_mpm_collider_pose(self.state_0)
+
+    def simulate_soil_substeps(self, count: int, dt: float) -> None:
+        self._copy_state_to_mpm_state()
+        wp.launch(
+            subtract_body_force_from_velocity,
+            dim=self.state_0.body_q.shape,
+            inputs=[
+                float(self.sim_dt),
+                self.state_0.body_q,
+                self.state_0.body_qd,
+                self.body_f_from_soil_prev,
+                self.model.body_inv_inertia,
+                self.model.body_inv_mass,
+                self.mpm_state.body_q,
+                self.mpm_state.body_qd,
+            ],
+        )
+
+        self.body_f_from_soil.assign(self._zero_body_force) # zeroes body force buffer
+        dt_divisor = float(count * dt)
+        # this loop is by far the biggest compute-time sink
+        for _ in range(count):
+            self._sync_mpm_collider_pose(self.mpm_state)
+            self.mpm_solver.step(self.mpm_state, self.mpm_state, contacts=None, control=None, dt=dt)
+            for _ in range(self.fidelity.projections):
+                self.mpm_solver.project_outside(self.mpm_state, self.mpm_state, dt)
+            self._compute_soil_reaction_forces(dt_divisor)
+        self._copy_particles_from_mpm_state()
+        self.body_f_from_soil_prev.assign(self.body_f_from_soil)
+
+    def simulate_coupled_frame_fixed(self, apply_viewer_forces: bool = True) -> None:
+        for _ in range(self.sim_substeps):
+            self.simulate_rigid_substep(self.sim_dt, apply_viewer_forces=apply_viewer_forces)
+            self.simulate_soil_substeps(self.mpm_substeps_per_rigid, self.mpm_dt)
+
+    # Controller (kept mainly for the built-in digging demo)
+    def apply_control(self) -> None:
+        if self.control_size == 0:
+            return
+
+        targets = self._joint_target_host.copy()
+        
+
+        if self.sim_time < self.settle_duration:
+            desired_map = {
+                "swing": 0.0,
+                "arm": 0.55,
+                "stick": 0.10,
+                "bucket": 0.55,
+            }
+        else:
+            # check if rotation is backwards???
+            desired_map = self._get_replay_desired_map(self.sim_time - self.settle_duration)
+
+        q_prevs = self.state_0.joint_q.numpy()
+
+        for section in self.joint_map.keys():
+            idx = self.joint_map[section]
+
+            q_prev = q_prevs[idx]
+            dq_max = self.joint_vel_limit[section] * self.frame_dt
+            q_cmd = desired_map[section]
+            q_cmd = q_prev + np.clip(q_cmd - q_prev, -dq_max, dq_max)
+            # might choose to clip to behaviour range, but the model won't obey them regardless
+            q_cmd = desired_map[section]
+            targets[idx] = q_cmd
+
+        if self.debug:
+            print(self.sim_time)
+            print(q_prevs[-4:])
+            print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
+            print(targets[-4:])
+        
+        # may desire some way to detect if the excavator leaves the platform
+        # for our purposes, we'll presume that leaving the platform is very unlikely
+        # to achieve any positive results within the time limit and just
+        # leave it at that
+
+        self.control.joint_target_pos.assign(targets)
+
+    # Task metrics / main loop
+    def count_particles_in_bucket(self) -> int:
+        if self.model.particle_count == 0:
+            return 0
+
+        positions = self.state_0.particle_q.numpy()
+        bx, by, bz = self.bucket_center
+        iw, il, idepth = self.bucket_inner_half
+        t = self.env_info.bucket_wall_thickness
+        inside = (
+            (positions[:, 0] >= bx - iw)
+            & (positions[:, 0] <= bx + iw)
+            & (positions[:, 1] >= by - il)
+            & (positions[:, 1] <= by + il)
+            & (positions[:, 2] >= bz + t)
+            & (positions[:, 2] <= bz + t + 2.0 * idepth)
+        )
+        return int(np.count_nonzero(inside))
+
+    def step(self) -> None:
         self.apply_control()
 
-        # Simulate excavator
-        if self.excavator_graph:
-            wp.capture_launch(self.excavator_graph)
+        if self.coupled_graph:
+            if self.debug:
+                print("Graph does exist, attempting launch")
+            wp.capture_launch(self.coupled_graph)
         else:
-            self.simulate_excavator()
+            self.simulate_coupled_frame_fixed(apply_viewer_forces=True)
 
-        # Simulate sand
-        if self.sand_graph:
-            wp.capture_launch(self.sand_graph)
-        else:
-            self.simulate_sand()
-
-        # Update time
         self.sim_time += self.frame_dt
 
-        # Count and report particles in bucket
         if self.sim_time - self.last_score_print >= self.score_print_interval:
             self.particles_in_bucket = self.count_particles_in_bucket()
-            pct = 100.0 * self.particles_in_bucket / max(self.total_particles, 1)
-            print(f"\n[t={self.sim_time:.1f}s] SCORE: {self.particles_in_bucket:,} / {self.total_particles:,} "
-                  f"particles in bucket ({pct:.1f}%)")
+
+            if self.debug:
+                pct = 100.0 * self.particles_in_bucket / max(self.total_particles, 1)
+                print(
+                    f"\n[t={self.sim_time:.1f}s] SCORE: {self.particles_in_bucket:,} / {self.total_particles:,} "
+                    f"particles in bucket ({pct:.2f}%) "
+                )
             self.last_score_print = self.sim_time
 
-        # Update viewer
+
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
 
-def main():
-    """Main entry point"""
-    # Initialize viewer with Newton's standard args
+def main() -> None:
     viewer, args = newton.examples.init()
 
-    # Use default MPM parameters
-    voxel_size = .03 # .05
-    particles_per_cell = 10 # 3
 
-    # Create simulation
-    example = ExcavatorMPMExample(
+    example = ExcavatorMPM(
         viewer,
-        voxel_size=voxel_size,
-        particles_per_cell=particles_per_cell
+        fidelity=SIM_PRESETS["experimental"],
+        debug=True
     )
 
-    # Run simulation loop
-    try:
-        while viewer.is_running():
-            example.step()
-    except KeyboardInterrupt:
-        print("\nSimulation stopped by user")
+    while viewer.is_running():
+        example.step()
 
 
 if __name__ == "__main__":
