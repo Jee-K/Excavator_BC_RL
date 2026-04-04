@@ -1,4 +1,5 @@
 import argparse
+import glob
 import json
 import math
 import os
@@ -252,13 +253,21 @@ def build_model(args, obs_dim: int, act_dim: int, num_primitives: int) -> nn.Mod
 
 def load_npz_bundle(path: str) -> DatasetBundle:
     data = np.load(path, allow_pickle=True)
-    required = ["obs", "act"]
-    missing = [k for k in required if k not in data]
-    if missing:
-        raise KeyError(f"Dataset missing required keys: {missing}")
 
-    obs = np.asarray(data["obs"], dtype=np.float32)
-    act = np.asarray(data["act"], dtype=np.float32)
+    # Accept both "obs"/"act" and "states"/"actions" key names
+    if "obs" in data:
+        obs = np.asarray(data["obs"], dtype=np.float32)
+    elif "states" in data:
+        obs = np.asarray(data["states"], dtype=np.float32)
+    else:
+        raise KeyError("Dataset missing required key: need 'obs' or 'states'")
+
+    if "act" in data:
+        act = np.asarray(data["act"], dtype=np.float32)
+    elif "actions" in data:
+        act = np.asarray(data["actions"], dtype=np.float32)
+    else:
+        raise KeyError("Dataset missing required key: need 'act' or 'actions'")
     n = obs.shape[0]
     if act.shape[0] != n:
         raise ValueError("obs and act must have same first dimension")
@@ -296,6 +305,110 @@ def load_npz_bundle(path: str) -> DatasetBundle:
         primitive_id=primitive_id,
         phase=phase,
         done=done,
+        obs_keys=obs_keys,
+        act_keys=act_keys,
+        primitive_names=primitive_names,
+    )
+
+
+PRIMITIVE_NAME_MAP = {0: "dig", 1: "dump", 2: "swing", 3: "return"}
+
+
+def load_directory_bundle(parent_dir: str) -> DatasetBundle:
+    """Load a dataset from a directory with subfolders named 0_*, 1_*, 2_*, 3_*.
+
+    Each subfolder's leading digit is the primitive_id. All .npz files inside
+    are separate episodes. State-action pairs are built from the 'states'/'actions'
+    (or 'obs'/'act') arrays in each file.
+    """
+    parent = Path(parent_dir)
+    subfolders = sorted([d for d in parent.iterdir() if d.is_dir()])
+
+    all_obs, all_act, all_episode_id, all_primitive_id, all_done = [], [], [], [], []
+    episode_counter = 0
+    primitive_names: Dict[int, str] = {}
+    obs_keys: List[str] = []
+    act_keys: List[str] = []
+
+    for folder in subfolders:
+        # Extract primitive id from leading digit of folder name (e.g. "0_dig_BC_data" -> 0)
+        folder_name = folder.name
+        if not folder_name[0].isdigit():
+            continue
+        prim_id = int(folder_name.split("_")[0])
+        if prim_id not in primitive_names:
+            primitive_names[prim_id] = PRIMITIVE_NAME_MAP.get(prim_id, f"primitive_{prim_id}")
+
+        npz_files = sorted(glob.glob(str(folder / "*.npz")))
+        if not npz_files:
+            print(f"  Warning: no .npz files in {folder}")
+            continue
+
+        for npz_path in npz_files:
+            data = np.load(npz_path, allow_pickle=True)
+
+            # Read obs/states
+            if "obs" in data:
+                obs = np.asarray(data["obs"], dtype=np.float32)
+            elif "states" in data:
+                obs = np.asarray(data["states"], dtype=np.float32)
+            else:
+                print(f"  Warning: skipping {npz_path} (no 'obs' or 'states' key)")
+                continue
+
+            # Read act/actions
+            if "act" in data:
+                act = np.asarray(data["act"], dtype=np.float32)
+            elif "actions" in data:
+                act = np.asarray(data["actions"], dtype=np.float32)
+            else:
+                print(f"  Warning: skipping {npz_path} (no 'act' or 'actions' key)")
+                continue
+
+            n = obs.shape[0]
+            if act.shape[0] != n:
+                print(f"  Warning: skipping {npz_path} (obs/act length mismatch)")
+                continue
+
+            all_obs.append(obs)
+            all_act.append(act)
+            all_episode_id.append(np.full(n, episode_counter, dtype=np.int64))
+            all_primitive_id.append(np.full(n, prim_id, dtype=np.int64))
+
+            done = np.zeros(n, dtype=np.bool_)
+            done[-1] = True
+            all_done.append(done)
+
+            if not obs_keys:
+                if "obs_keys" in data:
+                    obs_keys = list(map(str, data["obs_keys"].tolist()))
+                elif "joint_names" in data:
+                    obs_keys = list(map(str, data["joint_names"].tolist()))
+                else:
+                    obs_keys = [f"obs_{i}" for i in range(obs.shape[1])]
+                act_keys = obs_keys.copy()
+
+            print(f"  Loaded {os.path.basename(npz_path)}: {n} samples, "
+                  f"episode={episode_counter}, primitive={prim_id} ({primitive_names[prim_id]})")
+            episode_counter += 1
+
+    if not all_obs:
+        raise ValueError(f"No valid .npz files found in {parent_dir}")
+
+    obs_cat = np.concatenate(all_obs)
+    act_cat = np.concatenate(all_act)
+    n_total = obs_cat.shape[0]
+
+    print(f"\nCombined dataset: {n_total} samples, {episode_counter} episodes, "
+          f"{len(primitive_names)} primitives {primitive_names}")
+
+    return DatasetBundle(
+        obs=obs_cat,
+        act=act_cat,
+        episode_id=np.concatenate(all_episode_id),
+        primitive_id=np.concatenate(all_primitive_id),
+        phase=np.zeros(n_total, dtype=np.float32),
+        done=np.concatenate(all_done),
         obs_keys=obs_keys,
         act_keys=act_keys,
         primitive_names=primitive_names,
@@ -372,7 +485,10 @@ def train(args):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
-    bundle_raw = load_npz_bundle(args.dataset)
+    if os.path.isdir(args.dataset):
+        bundle_raw = load_directory_bundle(args.dataset)
+    else:
+        bundle_raw = load_npz_bundle(args.dataset)
     train_eps, val_eps = build_episode_split(bundle_raw, args.val_fraction, args.seed)
 
     train_mask = np.isin(bundle_raw.episode_id, np.asarray(train_eps))
@@ -490,7 +606,7 @@ def write_schema(path: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Primitive-conditioned behavioral cloning trainer for excavator-like continuous control.")
-    parser.add_argument("--dataset", type=str, help="Path to .npz dataset")
+    parser.add_argument("--dataset", type=str, help="Path to .npz file or parent directory with 0_*/1_*/2_*/3_* subfolders")
     parser.add_argument("--output-dir", type=str, default="./bc_runs/default")
     parser.add_argument("--arch", type=str, default="tcn", choices=["mlp", "gru", "tcn"])
     parser.add_argument("--context", type=int, default=16)

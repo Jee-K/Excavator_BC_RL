@@ -1,6 +1,10 @@
+*.md
 imgui.ini
 __pycache__/
 *.npz
 *.lock
 *.egg-info
 .venv/
+/*.ipynb
+bc_runs/
+/*.py
