@@ -477,7 +477,7 @@ def visualize_fit(
 # Example usage
 if __name__ == "__main__":
     # Load URDF
-    urdf_path = "/home/caee/Desktop/Excavator_BC_RL/excavatorURDF/robot_fixed_alternate.urdf"
+    urdf_path = "../excavatorURDF/robot_fixed_alternate.urdf"
     skeleton = ExcavatorURDFSkeleton(urdf_path)
 
     # Test forward kinematics

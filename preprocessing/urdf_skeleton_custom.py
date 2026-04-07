@@ -44,8 +44,8 @@ class CustomURDFSkeleton:
         self.keypoints: List[Keypoint] = []
         self.arm_joints = []  # Ordered list of joint names for control
 
-        print(f"Loaded URDF: {urdf_path}")
-        print(f"Available joints: {list(self.joint_info.keys())}")
+        # print(f"Loaded URDF: {urdf_path}")
+        # print(f"Available joints: {list(self.joint_info.keys())}")
 
     def _parse_joints(self) -> Dict:
         """Parse all joints from URDF"""
@@ -134,11 +134,11 @@ class CustomURDFSkeleton:
                 raise ValueError(f"Link '{link}' not found in URDF")
             self.keypoints.append(Keypoint(name, link, np.array(offset)))
 
-        print(f"\n✓ Skeleton defined:")
-        print(f"  Arm joints ({len(self.arm_joints)}): {self.arm_joints}")
-        print(f"  Keypoints ({len(self.keypoints)}):")
-        for i, kp in enumerate(self.keypoints):
-            print(f"    {i}. {kp.name} -> link '{kp.link}' + offset {kp.offset}")
+        # print(f"\n✓ Skeleton defined:")
+        # print(f"  Arm joints ({len(self.arm_joints)}): {self.arm_joints}")
+        # print(f"  Keypoints ({len(self.keypoints)}):")
+        # for i, kp in enumerate(self.keypoints):
+        #     print(f"    {i}. {kp.name} -> link '{kp.link}' + offset {kp.offset}")
 
     def forward_kinematics(self, joint_angles: np.ndarray) -> np.ndarray:
         """
@@ -282,6 +282,7 @@ class CustomKeypointIK:
         if self.prev_camera is not None:
             init_camera = self.prev_camera.copy()
         else:
+            # print(keypoints_2d.shape, visibility.shape, keypoints_2d, visibility)
             visible_kpts = keypoints_2d[visibility > 0.5]
             if len(visible_kpts) > 0:
                 spread = np.std(visible_kpts)
@@ -394,14 +395,33 @@ class CustomKeypointIK:
 
 # Example: Define your excavator skeleton
 if __name__ == "__main__":
-    urdf_path = "/home/caee/Desktop/Excavator_BC_RL/excavatorURDF/robot_fixed_alternate.urdf"
+    # urdf_path = "./excavatorURDF/excavator_lowpoly_locked_splitbucket.urdf"
+    # skeleton = CustomURDFSkeleton(urdf_path)
+
+    # # Define arm joints
+    # arm_joints = ["lower_arm", "upperToLow", "scoop1"]
+
+    # # Define keypoints (full body): (name, link, offset)
+    # keypoints = [
+    #     ("frame_front_mid", "compact_excavator_frame_body", np.array([0.800000, 0.000000, -0.000000])),
+    #     ("frame_rear_mid", "compact_excavator_frame_body", np.array([-0.800000, -0.000000, 0.000000])),
+    #     ("turret_center", "compact_excavator_turret_cabin_roller", np.array([-0.250000, -0.000000, -0.050000])),
+    #     ("arm_base", "part01_pin_1", np.array([0.040708, 0.093264, -0.319600])),
+    #     ("boom_tip", "upper_boom", np.array([-0.663317, 2.202642, -0.039292])),
+    #     ("stick_tip", "lower_boom", np.array([-0.048634, -1.046702, -0.095708])),
+    #     ("bucket_floor", "bucketry", np.array([0.010710, 0.293730, 0.095708])),
+    #     ("bucket_tip", "bucketry", np.array([-0.379012, 0.804848, 0.095708])),
+    # ]
+
+
+
+    urdf_path = "./excavatorURDF/excavator_lowpoly_locked_splitbucket.urdf"
 
     skeleton = CustomURDFSkeleton(urdf_path)
 
     # Define your skeleton!
     # 4 arm joints (in kinematic order)
     arm_joints = [
-        "full_arm_rotation",  # Joint 0
         "lower_arm",          # Joint 1
         "upperToLow",         # Joint 2
         "scoop1"              # Joint 3
@@ -417,23 +437,23 @@ if __name__ == "__main__":
         ("boom_base", "part01_pin_1", np.array([0.0, 0.0, 0.0])),
 
         # Keypoint 2: Boom-stick joint (elbow) - midpoint of boom link
-        ("boom_stick_joint", "part02_cmpl", np.array([0.0, 1.2, 0.0])),
+        ("boom_stick_joint", "upper_boom", np.array([0.0, 1.2, 0.0])),
 
         # Keypoint 3: Stick-bucket joint (wrist)
-        ("stick_bucket_joint", "part03", np.array([0.0, -0.6, 0.0])),
+        ("stick_bucket_joint", "lower_boom", np.array([0.0, -0.6, 0.0])),
 
         # Keypoint 4: Bucket attachment point
-        ("bucket_joint", "part04", np.array([0.1, 0.2, 0.0])),
+        ("bucket_joint", "bucketry", np.array([0.1, 0.2, 0.0])),
 
         # Keypoint 5: Bucket tip (end effector)
-        ("bucket_tip", "part04", np.array([0.2, 0.6, 0.0])),
+        ("bucket_tip", "bucketry", np.array([0.2, 0.6, 0.0])),
     ]
 
     skeleton.define_skeleton(arm_joints, keypoints)
 
     # Test forward kinematics
     print("\n=== Testing Forward Kinematics ===")
-    test_angles = np.array([0.2, 0.3, -0.1, 0.5])
+    test_angles = np.array([0.3, -0.1, 0.5])
     keypoints_3d = skeleton.forward_kinematics(test_angles)
 
     print(f"Joint angles: {test_angles}")
@@ -449,11 +469,37 @@ if __name__ == "__main__":
     camera_params = np.array([150.0, 320.0, 240.0])
     keypoints_2d = ik.project_3d_to_2d(keypoints_3d, camera_params)
 
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    KEYPOINT_ORDER = [
+        'frame_front_mid',
+        'frame_rear_mid',
+        'turret_center',
+        'arm_base',
+        'boom_tip',
+        'stick_tip',
+        'bucket_floor',
+        'bucket_tip',
+    ]
+    kp = keypoints_3d
+
+    fig.add_trace(go.Scatter3d(
+        x=kp[:, 0], y=kp[:, 1], z=kp[:, 2], 
+        mode='markers+text',
+        marker=dict(size=8, color='red', line=dict(width=1, color='black')),
+        text=KEYPOINT_ORDER,
+        textposition='top center',
+        textfont=dict(size=8),
+        name='Keypoints',
+        hovertemplate='<b>%{text}</b><br>X:%{x:.3f}<br>Y:%{y:.3f}<br>Z:%{z:.3f}<extra></extra>',
+    ))
+    fig.show()
+
     # Add noise and occlusions
-    keypoints_2d_noisy = keypoints_2d + np.random.randn(6, 2) * 3.0
-    visibility = np.ones(6)
-    visibility[3] = 0  # Occlude wrist
-    visibility[4] = 0  # Occlude bucket
+    keypoints_2d_noisy = keypoints_2d + np.random.randn(keypoints_2d.shape[0], 2) * 3.0
+    visibility = np.ones(keypoints_2d.shape[0])
+    visibility[2] = 0  # Occlude wrist
+    visibility[3] = 0  # Occlude bucket
 
     result = ik.fit_frame(keypoints_2d_noisy, visibility)
 
