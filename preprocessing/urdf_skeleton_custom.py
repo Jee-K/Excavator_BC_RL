@@ -14,6 +14,7 @@ Date: 2026-02-12
 
 import numpy as np
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as R
 from typing import Dict, List, Tuple, Optional
@@ -43,6 +44,9 @@ class CustomURDFSkeleton:
         # User will define these
         self.keypoints: List[Keypoint] = []
         self.arm_joints = []  # Ordered list of joint names for control
+
+        # --- ADDED: rest-pose world transforms for all links (used by world_to_local) ---
+        self.all_link_transforms = self._compute_all_link_transforms()
 
         print(f"Loaded URDF: {urdf_path}")
         print(f"Available joints: {list(self.joint_info.keys())}")
@@ -99,6 +103,42 @@ class CustomURDFSkeleton:
             name = link.get('name')
             links[name] = {'name': name}
         return links
+
+    # --- ADDED: two helpers that mirror what interactive_skeleton_builder.ipynb does ---
+
+    def _compute_all_link_transforms(self) -> Dict:
+        """BFS over the full URDF at zero joint angles to get each link's world transform."""
+        parent_links = {j['parent'] for j in self.joint_info.values()}
+        child_links  = {j['child']  for j in self.joint_info.values()}
+        root_link = (parent_links - child_links).pop()
+
+        link_transforms = {root_link: np.eye(4)}
+
+        parent_to_children: Dict[str, list] = {}
+        for jinfo in self.joint_info.values():
+            parent_to_children.setdefault(jinfo['parent'], []).append(jinfo)
+
+        queue = [root_link]
+        while queue:
+            current = queue.pop(0)
+            for jinfo in parent_to_children.get(current, []):
+                T = np.eye(4)
+                T[:3, :3] = R.from_euler('xyz', jinfo['rpy']).as_matrix()
+                T[:3, 3] = jinfo['xyz']
+                link_transforms[jinfo['child']] = link_transforms[current] @ T
+                queue.append(jinfo['child'])
+
+        return link_transforms
+
+    def world_to_local(self, world_xyz, link_name: str) -> np.ndarray:
+        """Convert a world-frame point (rest pose) to a local offset for *link_name*.
+        Use the coordinates you read off the interactive notebook hover, then pass
+        the result directly as the offset in define_skeleton()."""
+        T = self.all_link_transforms[link_name]
+        pt = np.array([*world_xyz, 1.0])
+        return (np.linalg.inv(T) @ pt)[:3]
+
+    # --- END ADDED ---
 
     def define_skeleton(
         self,
@@ -159,9 +199,11 @@ class CustomURDFSkeleton:
         # First, build the kinematic tree
         link_transforms = {}  # link_name -> (position, rotation_matrix)
 
-        # Start from root (assume first joint's parent is root)
+        # Start from the arm chain root using its URDF world position so that
+        # arm keypoints are in the same coordinate frame as body keypoints.
         root_link = self.joint_info[self.arm_joints[0]]['parent']
-        link_transforms[root_link] = (np.array([0.0, 0.0, 0.0]), np.eye(3))
+        T_root = self.all_link_transforms[root_link]
+        link_transforms[root_link] = (T_root[:3, 3].copy(), T_root[:3, :3].copy())
 
         # Traverse the arm joints in order
         for i, joint_name in enumerate(self.arm_joints):
@@ -198,9 +240,14 @@ class CustomURDFSkeleton:
 
         for i, kp in enumerate(self.keypoints):
             if kp.link not in link_transforms:
-                # Link not in our kinematic chain, use identity
-                # (This happens for base link keypoints)
-                link_pos, link_rot = np.array([0.0, 0.0, 0.0]), np.eye(3)
+                # Link not in the arm chain — use the full URDF rest-pose transform
+                # (e.g. frame_body, turret_cabin_roller for body keypoints)
+                T = self.all_link_transforms.get(kp.link)
+                if T is not None:
+                    link_pos = T[:3, 3]
+                    link_rot = T[:3, :3]
+                else:
+                    link_pos, link_rot = np.zeros(3), np.eye(3)
             else:
                 link_pos, link_rot = link_transforms[kp.link]
 
@@ -392,48 +439,227 @@ class CustomKeypointIK:
         self.prev_camera = None
 
 
-# Example: Define your excavator skeleton
-if __name__ == "__main__":
-    urdf_path = "/home/caee/Desktop/Excavator_BC_RL/excavatorURDF/robot_fixed_alternate.urdf"
+# --- ADDED: pre-built factory so other scripts can do:
+#       from urdf_skeleton_custom import build_excavator_skeleton
+#       skeleton = build_excavator_skeleton(urdf_path)
+#   World coordinates below come from interactive_skeleton_builder.ipynb (cell 9).
+#   To update: hover the mesh in the notebook, copy the world [x,y,z], replace here.
 
+DEFAULT_URDF_PATH = str(
+    Path(__file__).resolve().parent.parent / "excavatorURDF" / "excavator_lowpoly_locked_splitbucket.urdf"
+)
+
+
+class SideViewIK:
+    """Two-stage FK + IK for orthographic side-view excavator fitting.
+
+    Stage 1 — analytic:
+      Rotate 3D skeleton by known cabin_yaw, orthographic-project (Y horiz, -Z vert),
+      estimate TRUE physical scale once from the most side-on frame, anchor
+      translation to turret_center.
+
+    Stage 2 — IK:
+      Minimize reprojection error of 5 arm keypoints over 3 arm joint angles.
+
+    Keypoint index convention (KEYPOINT_ORDER):
+      0:bucket_tip  1:stick_tip  2:bucket_floor  3:boom_tip  4:arm_base
+      5:turret_center  6:frame_front_mid  7:frame_rear_mid
+    """
+
+    TURRET_IDX     = 5
+    FRAME_FRONT    = 6
+    FRAME_REAR     = 7
+    ARM_KP_INDICES = [0, 1, 2, 3, 4]
+
+    def __init__(self, skeleton: 'CustomURDFSkeleton', fixed_scale=None, facing=None):
+        self.skeleton = skeleton
+        self.joint_lower, self.joint_upper = skeleton.get_joint_limits()
+        self.n_joints = len(skeleton.arm_joints)
+        self.n_kp     = len(skeleton.keypoints)
+        self.prev_angles = None
+        self.fixed_scale = fixed_scale  # px/m; None = auto-estimate per sequence
+        self.facing = facing            # +1=arm left, -1=arm right, None=auto-detect
+
+    # ── scale estimation ──────────────────────────────────────────────────────
+
+    def estimate_scale(self, kp_2d_ref: np.ndarray, cabin_yaw_ref: float = 0.0) -> float:
+        zero_angles = np.zeros(self.n_joints)
+        kp_3d_ref   = self.skeleton.forward_kinematics(zero_angles)
+        proj_ref    = self._rotate_and_project(kp_3d_ref, cabin_yaw_ref)
+        obs_dist    = np.linalg.norm(kp_2d_ref[self.FRAME_FRONT] - kp_2d_ref[self.FRAME_REAR])
+        proj_dist   = np.linalg.norm(proj_ref[self.FRAME_FRONT]  - proj_ref[self.FRAME_REAR])
+        self.fixed_scale = obs_dist / proj_dist if proj_dist > 1e-6 else None
+        return self.fixed_scale
+
+    # ── projection ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def detect_facing(kp_2d: np.ndarray) -> int:
+        """+1 if arm/front on LEFT side of image, -1 if on RIGHT."""
+        return +1 if kp_2d[6, 0] < kp_2d[7, 0] else -1
+
+    def _rotate_and_project(self, kp_3d: np.ndarray, cabin_yaw_rad: float) -> np.ndarray:
+        """R_z(cabin_yaw) then orthographic project → (N,2) unnormalized."""
+        R_z = R.from_euler('z', cabin_yaw_rad).as_matrix()
+        kp_world = (R_z @ kp_3d.T).T
+        facing = self.facing if self.facing is not None else +1
+        # compensate cos(θ) sign flip when |cabin_yaw| > 90°
+        eff = facing * np.sign(np.cos(cabin_yaw_rad))
+        if eff == 0:
+            eff = facing
+        return np.stack([eff * kp_world[:, 1], -kp_world[:, 2]], axis=1)
+
+    def _projection_params(self, kp_3d: np.ndarray, cabin_yaw_rad: float,
+                           kp_2d: np.ndarray):
+        proj = self._rotate_and_project(kp_3d, cabin_yaw_rad)
+        if self.fixed_scale is not None:
+            scale = self.fixed_scale
+        else:
+            obs_dist  = np.linalg.norm(kp_2d[self.FRAME_FRONT] - kp_2d[self.FRAME_REAR])
+            proj_dist = np.linalg.norm(proj[self.FRAME_FRONT]  - proj[self.FRAME_REAR])
+            scale = obs_dist / proj_dist if proj_dist > 1e-6 else 100.0
+        tx = kp_2d[self.TURRET_IDX, 0] - scale * proj[self.TURRET_IDX, 0]
+        ty = kp_2d[self.TURRET_IDX, 1] - scale * proj[self.TURRET_IDX, 1]
+        return scale, tx, ty
+
+    def _apply_proj(self, proj_unnorm: np.ndarray, scale: float,
+                    tx: float, ty: float) -> np.ndarray:
+        return scale * proj_unnorm + np.array([tx, ty])
+
+    # ── per-frame fit ─────────────────────────────────────────────────────────
+
+    def fit_frame(self, kp_2d: np.ndarray, vis: np.ndarray,
+                  cabin_yaw_rad: float, temporal_weight: float = 0.1) -> dict:
+        init_angles = self.prev_angles if self.prev_angles is not None else np.zeros(self.n_joints)
+        kp_3d_any = self.skeleton.forward_kinematics(init_angles)
+        scale, tx, ty = self._projection_params(kp_3d_any, cabin_yaw_rad, kp_2d)
+
+        arm_vis = vis[self.ARM_KP_INDICES]
+        arm_2d  = kp_2d[self.ARM_KP_INDICES]
+
+        def loss(angles):
+            kp_3d   = self.skeleton.forward_kinematics(angles)
+            proj    = self._rotate_and_project(kp_3d, cabin_yaw_rad)
+            kp_proj = self._apply_proj(proj, scale, tx, ty)
+            reproj  = np.sum((arm_2d - kp_proj[self.ARM_KP_INDICES]) ** 2
+                             * arm_vis[:, np.newaxis])
+            temporal = (temporal_weight * np.sum((angles - self.prev_angles) ** 2)
+                        if self.prev_angles is not None and temporal_weight > 0 else 0.0)
+            return reproj + temporal
+
+        result = minimize(
+            loss, init_angles, method='L-BFGS-B',
+            bounds=[(self.joint_lower[i], self.joint_upper[i]) for i in range(self.n_joints)],
+            options={'maxiter': 500},
+        )
+        final_angles = result.x
+
+        kp_3d   = self.skeleton.forward_kinematics(final_angles)
+        proj    = self._rotate_and_project(kp_3d, cabin_yaw_rad)
+        kp_proj = self._apply_proj(proj, scale, tx, ty)
+        self.prev_angles = final_angles.copy()
+
+        vis_mask = vis > 0.5
+        arm_mask = arm_vis > 0.5
+        body_pts = [self.TURRET_IDX, self.FRAME_FRONT, self.FRAME_REAR]
+        return {
+            'joint_angles': final_angles,
+            'scale':        scale,
+            'translation':  np.array([tx, ty]),
+            'projected_2d': kp_proj,
+            'keypoints_3d': kp_3d,
+            'error':     (np.mean(np.sum((kp_2d - kp_proj) ** 2, axis=1)[vis_mask])
+                          if vis_mask.any() else 0.0),
+            'arm_error': (np.mean(np.sum((arm_2d - kp_proj[self.ARM_KP_INDICES]) ** 2,
+                                         axis=1)[arm_mask]) if arm_mask.any() else 0.0),
+            'body_error': np.mean(np.sum((kp_2d[body_pts] - kp_proj[body_pts]) ** 2, axis=1)),
+            'success':    result.success,
+        }
+
+    # ── sequence fit ──────────────────────────────────────────────────────────
+
+    def fit_sequence(self, all_kp_2d: np.ndarray, all_vis: np.ndarray,
+                     cabin_yaw_seq: np.ndarray, temporal_weight: float = 0.01,
+                     fix_scale: bool = True, verbose: bool = True) -> tuple:
+        """Fit skeleton to a full sequence. Returns (angles, errors, projected_2d)."""
+        T = len(all_kp_2d)
+        ref_t = int(np.argmin(np.abs(cabin_yaw_seq)))
+
+        if self.facing is None:
+            self.facing = self.detect_facing(all_kp_2d[ref_t])
+            if verbose:
+                side = 'LEFT' if self.facing == +1 else 'RIGHT'
+                print(f'Facing: {side}  '
+                      f'(frame_front.x={all_kp_2d[ref_t][6,0]:.0f}  '
+                      f'frame_rear.x={all_kp_2d[ref_t][7,0]:.0f})')
+
+        if fix_scale and self.fixed_scale is None:
+            self.estimate_scale(all_kp_2d[ref_t], cabin_yaw_seq[ref_t])
+            if verbose:
+                print(f'Scale: {self.fixed_scale:.2f} px/m  '
+                      f'(from frame {ref_t}, θ={np.degrees(cabin_yaw_seq[ref_t]):.1f}°)')
+
+        angles_seq    = np.zeros((T, self.n_joints))
+        errors        = np.zeros(T)
+        projected_seq = np.zeros_like(all_kp_2d)
+        self.prev_angles = None
+
+        for t in range(T):
+            res = self.fit_frame(all_kp_2d[t], all_vis[t], cabin_yaw_seq[t], temporal_weight)
+            angles_seq[t]    = res['joint_angles']
+            errors[t]        = res['error']
+            projected_seq[t] = res['projected_2d']
+            if verbose and (t % 20 == 0 or t == T - 1):
+                print(f'  [{t:3d}/{T}] err={res["error"]:.1f}px  '
+                      f'arm={res["arm_error"]:.1f}  body={res["body_error"]:.1f}  '
+                      f'scale={res["scale"]:.1f}  yaw={np.degrees(cabin_yaw_seq[t]):.1f}°')
+
+        if verbose:
+            print(f'Done. Mean error: {np.mean(errors):.2f} px')
+        return angles_seq, errors, projected_seq
+
+    def reset(self):
+        self.prev_angles = None
+        self.fixed_scale = None
+        self.facing = None
+
+
+def build_excavator_skeleton(urdf_path: str = DEFAULT_URDF_PATH) -> CustomURDFSkeleton:
+    """Return a ready-to-use CustomURDFSkeleton with the excavator keypoints baked in."""
     skeleton = CustomURDFSkeleton(urdf_path)
 
-    # Define your skeleton!
-    # 4 arm joints (in kinematic order)
-    arm_joints = [
-        "full_arm_rotation",  # Joint 0
-        "lower_arm",          # Joint 1
-        "upperToLow",         # Joint 2
-        "scoop1"              # Joint 3
-    ]
+    arm_joints = ["lower_arm", "upperToLow", "scoop1"]
 
-    # Define keypoints as (name, link, offset)
-    # These should match what you can detect in your videos!
+    # Local offsets computed by interactive_skeleton_builder.ipynb (world_to_local).
+    # Order matches KEYPOINT_ORDER in ik_from_annotations_testing.ipynb:
+    #   0:bucket_tip  1:stick_tip  2:bucket_floor  3:boom_tip
+    #   4:arm_base    5:turret_center  6:frame_front_mid  7:frame_rear_mid
+    # To update: re-run the notebook, copy the printed local arrays here.
     keypoints = [
-        # Keypoint 0: Cabin center (base reference)
-        ("cabin_center", "compact_excavator_cabin_body_cmpl", np.array([0.0, 0.0, 0.5])),
-
-        # Keypoint 1: Boom base joint (where boom attaches to cabin)
-        ("boom_base", "part01_pin_1", np.array([0.0, 0.0, 0.0])),
-
-        # Keypoint 2: Boom-stick joint (elbow) - midpoint of boom link
-        ("boom_stick_joint", "part02_cmpl", np.array([0.0, 1.2, 0.0])),
-
-        # Keypoint 3: Stick-bucket joint (wrist)
-        ("stick_bucket_joint", "part03", np.array([0.0, -0.6, 0.0])),
-
-        # Keypoint 4: Bucket attachment point
-        ("bucket_joint", "part04", np.array([0.1, 0.2, 0.0])),
-
-        # Keypoint 5: Bucket tip (end effector)
-        ("bucket_tip", "part04", np.array([0.2, 0.6, 0.0])),
+        ("bucket_tip",       "bucketry",                              np.array([ 0.098565,  0.961117,  0.095708])),
+        ("stick_tip",        "lower_boom",                            np.array([ 0.015942, -1.661787, -0.095708])),
+        ("bucket_floor",     "bucketry",                              np.array([ 0.371847,  0.589880,  0.095708])),
+        ("boom_tip",         "upper_boom",                            np.array([-0.817103,  2.330508, -0.039292])),
+        ("arm_base",         "part01_pin_1",                          np.array([ 0.040708,  0.093264, -0.319600])),
+        ("turret_center",    "compact_excavator_turret_cabin_roller",  np.array([-0.250000, -0.000000, -0.050000])),
+        ("frame_front_mid",  "compact_excavator_frame_body",          np.array([ 0.800000,  0.000000, -0.000000])),
+        ("frame_rear_mid",   "compact_excavator_frame_body",          np.array([-0.800000, -0.000000,  0.000000])),
     ]
 
     skeleton.define_skeleton(arm_joints, keypoints)
+    return skeleton
+
+# --- END ADDED ---
+
+
+if __name__ == "__main__":
+    skeleton = build_excavator_skeleton()
 
     # Test forward kinematics
     print("\n=== Testing Forward Kinematics ===")
-    test_angles = np.array([0.2, 0.3, -0.1, 0.5])
+    n_joints = len(skeleton.arm_joints)
+    n_keypoints = len(skeleton.keypoints)
+    test_angles = np.array([0.3, -0.1, 0.5])[:n_joints]
     keypoints_3d = skeleton.forward_kinematics(test_angles)
 
     print(f"Joint angles: {test_angles}")
@@ -445,15 +671,13 @@ if __name__ == "__main__":
     print("\n=== Testing IK ===")
     ik = CustomKeypointIK(skeleton)
 
-    # Simulate 2D projection
     camera_params = np.array([150.0, 320.0, 240.0])
     keypoints_2d = ik.project_3d_to_2d(keypoints_3d, camera_params)
 
-    # Add noise and occlusions
-    keypoints_2d_noisy = keypoints_2d + np.random.randn(6, 2) * 3.0
-    visibility = np.ones(6)
-    visibility[3] = 0  # Occlude wrist
-    visibility[4] = 0  # Occlude bucket
+    keypoints_2d_noisy = keypoints_2d + np.random.randn(n_keypoints, 2) * 3.0
+    visibility = np.ones(n_keypoints)
+    visibility[5] = 0  # Occlude stick_tip
+    visibility[6] = 0  # Occlude bucket_floor
 
     result = ik.fit_frame(keypoints_2d_noisy, visibility)
 
