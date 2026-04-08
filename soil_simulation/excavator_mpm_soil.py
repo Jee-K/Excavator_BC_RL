@@ -724,19 +724,22 @@ class ExcavatorMPM:
 def main() -> None:
     viewer, args = newton.examples.init()
 
+    preset = SIM_PRESETS["experimental"]
+
     sim_env = ExcavatorMPM(
         viewer,
-        fidelity=SIM_PRESETS["experimental"],
+        fidelity=preset,
         debug=True
     )
 
     COMMAND_HZ = 10
 
     while viewer.is_running():
-        for _ in range(COMMAND_HZ):
+        for _ in range(preset.fps // COMMAND_HZ):
             sim_env.step()
         # various data can be pulled from sim_env.attribute_name here, namely sim_env.state_0.joint_q has the current position information
-        sim_env.apply_control() # commands can be put in here
+        # sim_env.state_0.joint_q.numpy()
+        sim_env.apply_control(None) # commands can be put in here
 
 
 if __name__ == "__main__":

@@ -76,6 +76,8 @@ def build_segments(trajectories: np.ndarray, lead_frames_before_dig : int = 50, 
   With trajectories in Nx[base, boom, arm, scoop], lead frames and close frames being nonnegative ints, and bucket_flat_angle being a float-like representing radians
   """
 
+  # TODO: beware new trajectories shape
+
   candidates = []
 
   for idx, step in enumerate(trajectories[1:-1]):
@@ -142,7 +144,10 @@ def build_segments(trajectories: np.ndarray, lead_frames_before_dig : int = 50, 
 
   
 
-    
+# TODO: implement a dataset aggregation
+# turret rotation offset?
+# relative angle rather than true angle?
+
 
 
 
