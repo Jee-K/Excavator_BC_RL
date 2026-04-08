@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 /*.ipynb
 bc_runs/
+.ipynb_checkpoints/

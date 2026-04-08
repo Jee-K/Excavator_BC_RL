@@ -1,11 +1,6 @@
 import numpy as np
 from urdf_skeleton_custom import CustomURDFSkeleton
 
-BUCKET_FLAT_ANGLE = 1.1
-LEAD_FRAMES_BEFORE_DIG = 50
-CLOSE_FRAMES_BEFORE_RESET = 0
-
-
 def get_theta_rh_from_control(joints : np.ndarray) -> tuple[np.float64, np.float64, np.float64]:
 
   theta = joints[0]
@@ -17,7 +12,7 @@ def get_theta_rh_from_control(joints : np.ndarray) -> tuple[np.float64, np.float
   arm_joints = ["lower_arm", "upperToLow", "scoop1"]
 
   # Define keypoints (full body): (name, link, offset)
-  # !!!
+  # TODO we'd like this to be sourced... a different way. Even if they're baked permanently into the urdfskeleton class, that might still be better
   keypoints = [
     ("frame_front_mid", "compact_excavator_frame_body", np.array([0.800000, 0.000000, -0.000000])),
     ("frame_rear_mid", "compact_excavator_frame_body", np.array([-0.800000, -0.000000, 0.000000])),
@@ -76,7 +71,10 @@ def get_theta_rh_from_control(joints : np.ndarray) -> tuple[np.float64, np.float
 # then develop Se = <P_i less 50, Di_i, Du_i, Di_i+1, Q in [i less lead frames, i+1 less close frames]>
 # which are <starting position, goal dig, goal dump, goal reset (next dig), motion in that area>
 
-def build_segments(trajectories: np.ndarray) -> tuple:
+def build_segments(trajectories: np.ndarray, lead_frames_before_dig : int = 50, close_frames_before_reset : int = 0, bucket_flat_angle : float = 1.1) -> tuple:
+  """
+  With trajectories in Nx[base, boom, arm, scoop], lead frames and close frames being nonnegative ints, and bucket_flat_angle being a float-like representing radians
+  """
 
   candidates = []
 
@@ -90,14 +88,17 @@ def build_segments(trajectories: np.ndarray) -> tuple:
 
 
     # dig heuristic
-    if step_angle >= BUCKET_FLAT_ANGLE and (last_step_angle < step_angle >= next_step_angle):
+    if step_angle >= bucket_flat_angle and (last_step_angle < step_angle >= next_step_angle):
       candidates.append((idx, "Dig"))
 
     # dump heuristic
-    elif step_angle <= BUCKET_FLAT_ANGLE and (last_step_angle > step_angle <= next_step_angle):
+    elif step_angle <= bucket_flat_angle and (last_step_angle > step_angle <= next_step_angle):
       candidates.append((idx, "Dump"))
 
-  # TODO add the last position as a false-dig which will serve as a return for the last segment, if no good dig exists
+  # add the last position as a false-dig which will serve as a return for the last segment, if no good dig exists
+  # strictly speaking, this is a shortcut to avoid a loss of training data which may otherwise be useful even when
+  # a well formed end goal does not exist
+  candidates.append((len(trajectories), "Dig"))
 
   # form segments
   segments : list[tuple[int, int, int]] = []
@@ -131,8 +132,8 @@ def build_segments(trajectories: np.ndarray) -> tuple:
 
   for dig_idx, dump_idx, reset_idx in segments:
 
-    start_idx = min(0, dig_idx - LEAD_FRAMES_BEFORE_DIG)
-    seq_end_idx = min(0, reset_idx + 1 - CLOSE_FRAMES_BEFORE_RESET)
+    start_idx = min(0, dig_idx - lead_frames_before_dig)
+    seq_end_idx = int(np.clip(reset_idx + 1 - close_frames_before_reset, 0, len(trajectories)))
 
 
     labeled_segments.append((get_theta_rh_from_control(trajectories[dig_idx]), get_theta_rh_from_control(trajectories[dump_idx]), get_theta_rh_from_control(trajectories[reset_idx]), trajectories[start_idx:seq_end_idx]))

@@ -395,6 +395,7 @@ class CustomKeypointIK:
 
 # Example: Define your excavator skeleton
 if __name__ == "__main__":
+    # TODO: consider baking this information into the skeleton class, since we'll only be using one model anyways
     # urdf_path = "./excavatorURDF/excavator_lowpoly_locked_splitbucket.urdf"
     # skeleton = CustomURDFSkeleton(urdf_path)
 
