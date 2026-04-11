@@ -2,8 +2,6 @@
 """
 Lighter-weight, task-specific excavator + MPM soil simulation
 """
-# these aren't necessary, but they make it easier to read
-from typing import Iterable
 
 # necessaries
 from dataclasses import dataclass
@@ -638,7 +636,7 @@ class ExcavatorMPM:
             self.simulate_soil_substeps(self.mpm_substeps_per_rigid, self.mpm_dt)
 
     # Controller
-    def apply_control(self, user_targets : Iterable[float, float, float, float] | None = None) -> None:
+    def apply_control(self, user_targets : list[float, float, float, float] | None = None) -> None:
         if not user_targets:
             return
 
