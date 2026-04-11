@@ -95,7 +95,7 @@ class PolicyBase(nn.Module):
         assert self.training # thus, we are in train mode
         
         optimizer.zero_grad(set_to_none=True)
-        out = self.step(batch)
+        out = self.forward(batch)
         loss = out.get("loss")
         if loss is None:
             raise RuntimeError("step(batch) did not return a training loss.")
