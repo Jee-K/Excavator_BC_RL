@@ -8,3 +8,6 @@ __pycache__/
 /*.ipynb
 bc_runs/
 .ipynb_checkpoints/
+seq_data/*/*
+*.h5
+training_data/*.txt
