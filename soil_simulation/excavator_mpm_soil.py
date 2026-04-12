@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Excavator + MPM soil simulation with necessary RL compromise.
+Lighter-weight, task-specific excavator + MPM soil simulation
 """
-# these aren't necessary, but they make it easier to read
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 # necessaries
+from dataclasses import dataclass
 import numpy as np
 
 # main simulation tools
@@ -301,26 +298,10 @@ class ExcavatorMPM:
 
         self.control = self.model.control()
         self._joint_target_host = self.control.joint_target_pos.numpy()
-        self.control_size = int(self._joint_target_host.shape[0])
 
         self.control_lower, self.control_upper = self.model.joint_limit_lower, self.model.joint_limit_upper
-        self.joint_map = {"swing": 6, "arm":7, "stick":8, "bucket":9}
-        self.joint_vel_limit = {
-            "swing": 1.0,
-            "arm": 0.8,
-            "stick": 1.5,
-            "bucket": 3.0,
-        }
-
-        # TODO
-        # this replay information will need to be cut out, to some extent, somehow
-        # likely, we'll replace this with an option to pass in a function
-        self.target_replay_path = Path("./bc_component/BC_dataset/swing/swing_3_bc_dataset.npz")
-        self.target_replay_hz = 10.0
-        self.target_replay_start_time_s = 0.0
-        self.target_replay_states: Optional[np.ndarray] = None
-        self.target_replay_key: Optional[str] = None
-        self._load_target_state_replay()
+        self.first_joint_idx = 6
+        self.joint_vel_limits = [1.0, 0.8, 1.5, 3.0] # swing, arm, stick bucket # ??? could be parsed from urdf
 
         self.total_particles = int(self.model.particle_count)
         self.particles_in_bucket = 0
@@ -332,80 +313,6 @@ class ExcavatorMPM:
         self.viewer.show_triangles = False # corresponds to the cloth option
 
         # self.capture() # !!!
-
-    # Target-state replay inputs
-    @staticmethod
-    def _select_numeric_array_from_npz(data: np.lib.npyio.NpzFile) -> tuple[str, np.ndarray]:
-        preferred_keys = ("target_states", "states", "targets", "target", "arr_0")
-        for key in preferred_keys:
-            if key in data.files:
-                arr = np.asarray(data[key])
-                if np.issubdtype(arr.dtype, np.number):
-                    return key, arr
-        for key in data.files:
-            arr = np.asarray(data[key])
-            if np.issubdtype(arr.dtype, np.number):
-                return key, arr
-        raise ValueError("No numeric arrays found in target-state npz file.")
-
-    def _load_target_state_replay(self) -> None:
-        self.target_replay_active = False
-        if not self.target_replay_path:
-            print(
-                "Target-state replay disabled. Place target_angles.npz next to this Python file to drive the excavator from a 10 Hz target-state file."
-            )
-            return
-
-        try:
-            with np.load(self.target_replay_path, allow_pickle=False) as data:
-                key, states = self._select_numeric_array_from_npz(data)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load target-state replay file '{self.target_replay_path.name}': {exc}")
-
-        states = np.asarray(states, dtype=np.float64)
-        if states.ndim == 1:
-            states = states.reshape(1, -1)
-        if states.ndim != 2:
-            print(
-                f"Target-state replay file must contain a 2D array [T, D], but got shape {states.shape}."
-            )
-            return
-
-        self.target_replay_states = states
-        self.target_replay_key = key
-
-        # hardcoded, but checked
-        assert states.shape[1] == 4
-        
-        self.target_replay_active = bool(states.shape[0] > 0)
-
-        duration_s = 0.0
-        if states.shape[0] > 1 and self.target_replay_hz > 0.0:
-            duration_s = float(states.shape[0] - 1) / float(self.target_replay_hz)
-        print(
-            "Loaded target-state replay:",
-            f"file={self.target_replay_path.name}",
-            f"array={key}",
-            f"hz={self.target_replay_hz:.3f}",
-            f"duration_s={duration_s:.3f}",
-        )
-
-    def _get_replay_desired_map(self, time: float) -> Optional[dict[str, float]]:
-        states = self.target_replay_states
-
-        replay_sample = time * float(self.target_replay_hz)
-
-        replay_sample = np.clip(replay_sample, 0.0, states.shape[0] - 1)
-        row = states[int(np.floor(replay_sample))]
-
-        # ??? interpolate
-
-        return {
-            "swing": float(row[0]) - 2, # TODO: this value often needs modification to be placed into reasonable locations, hence the -2 here
-            "arm": float(row[1]),
-            "stick": float(row[2]),
-            "bucket": float(row[3]),
-        }
 
     # Scene and material setup
     def configure_rigid_defaults(self, builder) -> None:
@@ -728,42 +635,33 @@ class ExcavatorMPM:
             self.simulate_rigid_substep(self.sim_dt, apply_viewer_forces=apply_viewer_forces)
             self.simulate_soil_substeps(self.mpm_substeps_per_rigid, self.mpm_dt)
 
-    # Controller (kept mainly for the built-in digging demo)
-    def apply_control(self) -> None:
-        if self.control_size == 0:
+    # Controller
+    def apply_control(self, user_targets : list[float, float, float, float] | None = None) -> None:
+        if not user_targets:
             return
 
         targets = self._joint_target_host.copy()
         
 
         if self.sim_time < self.settle_duration:
-            desired_map = {
-                "swing": 0.0,
-                "arm": 0.55,
-                "stick": 0.10,
-                "bucket": 0.55,
-            }
-        else:
-            # check if rotation is backwards???
-            desired_map = self._get_replay_desired_map(self.sim_time - self.settle_duration)
+            user_targets = [0.0, 0.55, 0.10, 0.55]
 
         q_prevs = self.state_0.joint_q.numpy()
 
-        for section in self.joint_map.keys():
-            idx = self.joint_map[section]
-
+        # this could be vectorized, likely
+        for local_idx, target in enumerate(user_targets):
+            idx = local_idx + self.first_joint_idx
+            
             q_prev = q_prevs[idx]
-            dq_max = self.joint_vel_limit[section] * self.frame_dt
-            q_cmd = desired_map[section]
-            q_cmd = q_prev + np.clip(q_cmd - q_prev, -dq_max, dq_max)
-            # might choose to clip to behaviour range, but the model won't obey them regardless
-            q_cmd = desired_map[section]
+            dq_max = self.joint_vel_limits[local_idx] * self.frame_dt
+            q_cmd = target
+            # q_cmd = q_prev + np.clip(q_cmd - q_prev, -dq_max, dq_max) # !!! this is what enforces motion limits
             targets[idx] = q_cmd
 
         if self.debug:
             print(self.sim_time)
             print(q_prevs[-4:])
-            print([desired_map["swing"], desired_map["arm"], desired_map["stick"], desired_map["bucket"]])
+            print(user_targets)
             print(targets[-4:])
         
         # may desire some way to detect if the excavator leaves the platform
@@ -824,15 +722,22 @@ class ExcavatorMPM:
 def main() -> None:
     viewer, args = newton.examples.init()
 
+    preset = SIM_PRESETS["experimental"]
 
-    example = ExcavatorMPM(
+    sim_env = ExcavatorMPM(
         viewer,
-        fidelity=SIM_PRESETS["experimental"],
+        fidelity=preset,
         debug=True
     )
 
+    COMMAND_HZ = 10
+
     while viewer.is_running():
-        example.step()
+        for _ in range(preset.fps // COMMAND_HZ):
+            sim_env.step()
+        # various data can be pulled from sim_env.attribute_name here, namely sim_env.state_0.joint_q has the current position information
+        # sim_env.state_0.joint_q.numpy()
+        sim_env.apply_control(None) # commands can be put in here
 
 
 if __name__ == "__main__":

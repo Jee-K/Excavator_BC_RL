@@ -1,0 +1,2 @@
+file format should be in 
+seq_data/<any name here>/sequences/<any seq identifier here>/joint_angles.npz

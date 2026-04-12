@@ -475,7 +475,7 @@
 
 <link name="part01_pin_1">
 <visual>
-<origin xyz="5.5511151231257827021e-17 0.075000000000000066613 -0.14999999999999991118" rpy="-1.570796326794896336 -1.0229781560970241615e-32 -1.0786613209190211373e-18" />
+<origin xyz="0 0.075 -0.15" rpy="-1.57 0 0" />
 <geometry>
 <mesh filename="part01_pin_1.stl"/>
 </geometry>
@@ -484,7 +484,7 @@
 </material>
 </visual>
 <collision>
-<origin xyz="5.5511151231257827021e-17 0.075000000000000066613 -0.14999999999999991118" rpy="-1.570796326794896336 -1.0229781560970241615e-32 -1.0786613209190211373e-18" />
+<origin xyz="0 0.075 -0.15" rpy="-1.57 0 0" />
 <geometry>
 <mesh filename="part01_pin_1.stl"/>
 </geometry>
@@ -498,7 +498,7 @@
 
 <link name="upper_boom">
 <visual>
-<origin xyz="-5.5511151231257827021e-17 -1.1102230246251565404e-16 -0.079999999999999960032" rpy="1.1074279484825693178e-17 -2.3294852247529708059e-17 -3.4329673547550310366e-17" />
+<origin xyz="0 0 -0.08" rpy="0 0 0" />
 <geometry>
 <mesh filename="part02.stl"/>
 </geometry>
@@ -507,7 +507,7 @@
 </material>
 </visual>
 <collision>
-<origin xyz="-5.5511151231257827021e-17 -1.1102230246251565404e-16 -0.079999999999999960032" rpy="1.1074279484825693178e-17 -2.3294852247529708059e-17 -3.4329673547550310366e-17" />
+<origin xyz="0 0 -0.08" rpy="0 0 0" />
 <geometry>
 <mesh filename="part02.stl"/>
 </geometry>
@@ -521,7 +521,7 @@
 
 <link name="lower_boom">
 <visual>
-<origin xyz="0 -4.4408920985006261617e-16 -0.054999999999999882316" rpy="-3.141592653589793116 2.5675439038353784707e-17 7.288237150455586376e-19" />
+<origin xyz="0 0 -0.055" rpy="-3.141592653589793116 0 0" />
 <geometry>
 <mesh filename="part03.stl"/>
 </geometry>
@@ -530,7 +530,7 @@
 </material>
 </visual>
 <collision>
-<origin xyz="0 -4.4408920985006261617e-16 -0.054999999999999882316" rpy="-3.141592653589793116 2.5675439038353784707e-17 7.288237150455586376e-19" />
+<origin xyz="0 0 -0.055" rpy="-3.141592653589793116 0 0" />
 <geometry>
 <mesh filename="part03.stl"/>
 </geometry>
@@ -544,7 +544,7 @@
 
 <link name="bucketry">
 <visual>
-<origin xyz="0.059999999999999609201 0.14000000000000034639 0.054999999999999715783" rpy="-1.570796326794896558 -1.570796326794896558 0" />
+<origin xyz="0.06 0.14 0.055" rpy="-1.57 -1.57 0" />
 <geometry>
 <mesh filename="part04.stl"/>
 </geometry>
@@ -553,7 +553,7 @@
 </material>
 </visual>
 <collision>
-<origin xyz="0.059999999999999609201 0.14000000000000034639 0.054999999999999715783" rpy="-1.570796326794896558 -1.570796326794896558 0" />
+<origin xyz="0.06 0.14 0.055" rpy="-1.57 -1.57 0" />
 <geometry>
 <mesh filename="part04.stl"/>
 </geometry>
@@ -650,7 +650,7 @@
 
 
 <joint name="scoop1" type="revolute">
-<origin xyz="0.11999999999999966249 -1.5403327562575594989 -3.8857805861880478915e-16" rpy="3.1415926535897895633 -3.1950791765547316365e-15 -0.80531265657487949294" />
+<origin xyz="0.12 -1.54 0" rpy="3.1415926535897895633 0 -0.805" />
 <parent link="lower_boom" />
 <child link="bucketry" />
 <axis xyz="0 0 1"/>
@@ -659,7 +659,7 @@
 </joint>
 
 <joint name="upperToLow" type="revolute">
-<origin xyz="-0.83999999999999985789 2.3549999999999999822 -0.13499999999999978684" rpy="-3.1415926535897877869 -7.0950929862569758372e-15 1.2267499240314121423" />
+<origin xyz="-0.84 2.355 -0.135" rpy="-3.1415926535897877869 0 1.23" />
 <parent link="upper_boom" />
 <child link="lower_boom" />
 <axis xyz="0 0 1"/>
@@ -668,7 +668,7 @@
 </joint>
 
 <joint name="lower_arm" type="revolute">
-<origin xyz="0.079999999999999904521 0.074999999999999733546 -0.14999999999999980016" rpy="-1.570796326794896558 0.69362897114705091006 -1.5707963267948985564" />
+<origin xyz="0.08 0.075 -0.15" rpy="-1.57 0.7 -1.57" />
 <parent link="part01_pin_1" />
 <child link="upper_boom" />
 <axis xyz="0 0 1"/>
@@ -677,13 +677,7 @@
 </joint>
 
 <joint name="full_arm_rotation" type="fixed">
-<!-- this for type revolute -->
-<!-- <origin xyz="-0.040707723917193440466 -0.80673603465099630316 0.38039999999999996039" rpy="3.141592653589793116 1.3405772267554363358e-16 0.49184482936957452104" />
-<parent link="compact_excavator_cabin_body_cmpl" />
-<child link="part01_pin_1" />
-<axis xyz="0 0 1"/>
-<limit effort="5000" velocity="1" lower="-0.1" upper="0.8"/> -->
-<origin xyz="-0.040707723917193440466 -0.80673603465099630316 0.38039999999999996039" rpy="3.141592653589793116 0 0" />
+<origin xyz="-0.04 -0.8 0.38" rpy="3.141592653589793116 0 0" />
 <parent link="compact_excavator_cabin_body_cmpl" />
 <child link="part01_pin_1" />
 <axis xyz="0 0 1"/>

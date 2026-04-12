@@ -7,4 +7,8 @@ __pycache__/
 .venv/
 /*.ipynb
 bc_runs/
-/*.py
+.ipynb_checkpoints/
+seq_data/*/*
+*.h5
+training_data/*.txt
+bc_component/outputs
