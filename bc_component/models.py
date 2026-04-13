@@ -46,6 +46,64 @@ class StepOutput:
     metrics: Optional[Dict[str, Tensor]] = None
 
 
+class SingleStepMLP(nn.Module):
+    """
+    Simple pointwise MLP baseline.
+
+    Maps:
+        (goal, current_state) -> next_state
+
+    Batch convention:
+        batch = {
+            "state": Tensor[B, state_dim],
+            "goal": Tensor[B, goal_dim],
+            "action_targets": Tensor[B, action_dim],
+        }
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        goal_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int],
+        dropout: float = 0.0,
+        loss_func=F.mse_loss,
+    ) -> None:
+        super().__init__()
+
+        self.state_dim = state_dim
+        self.goal_dim = goal_dim
+        self.action_dim = action_dim
+        self.hidden_dims = list(hidden_dims)
+        self.dropout = dropout
+        self.loss_func = loss_func
+
+        dims = [state_dim + goal_dim, *hidden_dims, action_dim]
+        layers: List[nn.Module] = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(nn.ReLU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+        self.net = nn.Sequential(*layers)
+
+    def train_step(self, batch: Dict[str, Tensor]) -> Tensor:
+        states = batch["state"]
+        goals = batch["goal"]
+
+        predicted_actions = self.forward(states, goals)
+        action_targets = batch["action_targets"]
+        loss = self.loss_func(predicted_actions, action_targets)
+        return loss
+
+    def forward(self, state: Tensor, goal: Tensor) -> Tensor:
+        x = torch.cat([state, goal], dim=-1)
+        predicted_actions = self.net(x)
+        return predicted_actions
+
+
 class PolicyBase(nn.Module):
     """Shared helpers for the policy classes."""
 

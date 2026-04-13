@@ -33,6 +33,14 @@ class SoilProperties:
     interface_friction_mu: float = 0.55
     internal_friction_mu: float = .45
 
+    # density_kg_m3: float = 1650.0
+    # youngs_modulus_pa: float = 3.0e6
+    # poisson_ratio: float = 0.28
+    # friction_angle_deg: float = 36.0
+    # cohesion_pa: float = 4_000.0
+    # interface_friction_mu: float = 0.45
+    # internal_friction_mu: float = .65
+
 @dataclass(frozen=True)
 class EnvironmentPreset:
     # excavator information, rotation largely excluded
@@ -69,15 +77,6 @@ class SimulationFidelity:
 
 
 SIM_PRESETS: dict[str, SimulationFidelity] = {
-    "balanced": SimulationFidelity(
-        voxel_size_m=0.020,
-        rigid_substeps=6,
-        mpm_iterations_per_rigid=6,
-        rigid_ls_iterations=60,
-        rigid_njmax=260,
-        fps = 30,
-        projections = 2,
-    ),
     "experimental": SimulationFidelity(
         voxel_size_m=0.030,
         rigid_substeps=3,
@@ -184,7 +183,7 @@ class ExcavatorMPM:
         builder.default_shape_cfg.has_particle_collision = True
         builder.default_shape_cfg.is_solid = True
 
-        # Reusable explicit configs for static/proxy geoms added outside the URDF.
+        # Reusable, outside the urdf
         self.static_particle_contact_cfg = newton.ModelBuilder.ShapeConfig(
             ke=1.0e6,
             kd=1.0e4,
@@ -229,7 +228,9 @@ class ExcavatorMPM:
         for i in range(control_start, control_end):
             builder.joint_target_ke[i] = 5000.0
             builder.joint_target_kd[i] = 500.0
-        builder.joint_target_ke[7] = 50000 # back boom needs some help
+        builder.joint_target_ke[6] = 3000.0 # turret base does NOT need help
+        builder.joint_target_kd[6] = 1000.0
+        builder.joint_target_ke[7] = 10000.0 # back boom needs some help
 
         self.create_mpm_soil_bank(builder)
         self.add_ground_plane(builder)
@@ -254,15 +255,15 @@ class ExcavatorMPM:
         mpm_options.strain_basis = "P0"
         mpm_options.max_iterations = 50
         mpm_options.critical_fraction = 0.0
-        mpm_options.air_drag = 0.5
-        mpm_options.collider_basis = "Q1" # big alt is P0
-        mpm_options.collider_velocity_mode = "finite_difference"
+        mpm_options.air_drag = 2.0
+        mpm_options.collider_basis = "Q1" # big alt is P0 vs Q1
+        mpm_options.collider_velocity_mode = "backward"
 
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
             ls_iterations=self.fidelity.rigid_ls_iterations,
             njmax=self.fidelity.rigid_njmax,
-            ccd_iterations = 60,
+            ccd_iterations = 100,
         )
 
         self.mpm_solver = SolverImplicitMPM(self.model, mpm_options)
@@ -301,7 +302,7 @@ class ExcavatorMPM:
 
         self.control_lower, self.control_upper = self.model.joint_limit_lower, self.model.joint_limit_upper
         self.first_joint_idx = 6
-        self.joint_vel_limits = [1.0, 0.8, 1.5, 3.0] # swing, arm, stick bucket # ??? could be parsed from urdf
+        self.joint_vel_limits = [1.0, 0.8, 1.5, 3.0] # swing, arm, stick bucket # plausibly could be parsed from urdf instead
 
         self.total_particles = int(self.model.particle_count)
         self.particles_in_bucket = 0
@@ -450,6 +451,7 @@ class ExcavatorMPM:
         positions = (occupied_cells[:, None, :] + jitter).reshape(-1, 3)
 
         particle_mass = self.soil_info.density_kg_m3 * ((self.voxel_size / 2)** 3) * 4/3 * np.pi
+        # particle_mass = self.soil_info.density_kg_m3 * (self.voxel_size ** 3)
         for p in positions:
             builder.add_particle(
                 pos=wp.vec3(float(p[0]), float(p[1]), float(p[2])),
@@ -634,6 +636,7 @@ class ExcavatorMPM:
         for _ in range(self.sim_substeps):
             self.simulate_rigid_substep(self.sim_dt, apply_viewer_forces=apply_viewer_forces)
             self.simulate_soil_substeps(self.mpm_substeps_per_rigid, self.mpm_dt)
+
 
     # Controller
     def apply_control(self, user_targets : list[float, float, float, float] | None = None) -> None:

@@ -50,16 +50,15 @@ from torch import Tensor, nn
 from torchvision.transforms import Normalize
 
 # from single_step_mlp_bc_train_joint_scaled import SingleStepGoalConditionedMLP
+# import importlib
 
-class SingleStepGoalConditionedMLP(nn.Module):
-    """Same architecture used by the single-step trainer."""
-
+class SingleStepMLP(nn.Module):
     def __init__(
         self,
         state_dim: int,
         goal_dim: int,
         action_dim: int,
-        hidden_dims: Sequence[int] = (256, 256),
+        hidden_dims: Sequence[int],
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -75,20 +74,12 @@ class SingleStepGoalConditionedMLP(nn.Module):
 
     def forward(self, state: Tensor, goal: Tensor) -> Tensor:
         x = torch.cat([state, goal], dim=-1)
-        return self.net(x)
+        output = self.net(x)
+        return output
 
 
-def choose_device(requested: str = "auto") -> torch.device:
-    requested = requested.lower()
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available.")
-        return torch.device("cuda")
-    if requested == "cpu":
-        return torch.device("cpu")
-    raise ValueError(f"Unsupported device option: {requested!r}")
+def choose_device(requested) -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _as_float_tensor(x: Any, device: torch.device | None = None) -> Tensor:
@@ -198,7 +189,7 @@ class JointScaledSSMLPPolicy:
 
     @torch.no_grad()
     def act(self, current_joint_positions: np.ndarray | Sequence[float] | Tensor, goal: np.ndarray | Sequence[float] | Tensor) -> np.ndarray:
-        """Return the next raw joint-position target as a NumPy array of shape (4,)."""
+        """Return the next raw joint-position target as a NumPy array of shape (4,)."""        
         state_t = self.preprocess_state(current_joint_positions)
         goal_t = self.preprocess_goal(goal)
 
@@ -258,7 +249,7 @@ def load_ssmlp_policy(
     model_cfg = config["model"]
     norm_cfg = _extract_norm_config(config)
 
-    model = SingleStepGoalConditionedMLP(
+    model = SingleStepMLP(
         state_dim=int(model_cfg["state_dim"]),
         goal_dim=int(model_cfg["goal_dim"]),
         action_dim=int(model_cfg["action_dim"]),
@@ -282,11 +273,11 @@ def load_ssmlp_policy(
 
 @torch.no_grad()
 def run_policy_loop(
-    sim_env: Any,
-    viewer: Any,
-    preset: Any,
-    goal: np.ndarray | Sequence[float] | Tensor,
-    checkpoint_dir: str | Path = "/outputs/ssmlp",
+    sim_env,
+    viewer,
+    preset: "SimulationFidelity",
+    goal: np.ndarray | Tensor,
+    checkpoint_dir: str,
     which: str = "best.pt",
     device: str = "auto",
     command_hz: int = 10,
@@ -305,12 +296,8 @@ def run_policy_loop(
             target_joint_positions = policy.act(current_joint_positions, goal)
             sim_env.apply_control(target_joint_positions.tolist())
     """
-    if command_hz <= 0:
-        raise ValueError(f"command_hz must be positive, got {command_hz}")
-    if preset.fps < command_hz:
-        raise ValueError(
-            f"preset.fps ({preset.fps}) must be >= command_hz ({command_hz}) so the control loop can step the sim."
-        )
+    assert command_hz > 0
+    assert preset.fps >= command_hz
 
     policy = load_ssmlp_policy(
         checkpoint_dir=checkpoint_dir,
@@ -345,16 +332,16 @@ if __name__ == "__main__":
 
     COMMAND_HZ = 10
 
-    HARDCODED_GOAL = np.array([[0,0,0],[1,0,2],[0,0,0]], dtype=np.float32)
+    # r, h, theta # !!! obviously, these goals are bad
+    HARDCODED_GOAL = np.array([[.8,7.4940055485687E-17,0],[.8,7.4940055485687E-17,2],[.8,7.4940055485687E-17,0]], dtype=np.float32)
 
     run_policy_loop(
         sim_env=sim_env,
         viewer=viewer,
         preset=preset,
         goal=HARDCODED_GOAL,
-        checkpoint_dir='./bc_component/outputs/ssmlp_js',
+        checkpoint_dir='./bc_component/outputs/ssmlp_js_dag',
         which='best.pt',
-        device='auto',
         command_hz=10,
-        joint_indices=[0, 1, 2, 3],
+        joint_indices=[6, 7, 8, 9],
     )

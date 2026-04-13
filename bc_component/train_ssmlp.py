@@ -36,6 +36,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Normalize
 import numpy as np
 
+from models import SingleStepMLP
+
 
 # Prenormalization values. The rotator is somewhat approximate and could probably be replaced with a scaled approach instead
 JOINT_STATE_RAW_MIN = torch.tensor([-1.5 * np.pi, -0.45, -0.9, -1.222], dtype=torch.float32)
@@ -45,29 +47,23 @@ JOINT_STATE_RAW_MAX = torch.tensor([1.5 * np.pi, 1.0, 0.3, 0.873], dtype=torch.f
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a single-step goal-conditioned MLP BC policy.")
     parser.add_argument("--data", type=str, required=True, help="Path to the HDF5 segment store.")
-    parser.add_argument("--output-dir", type=str, required=True, help="Directory for checkpoints and logs.")
+    parser.add_argument("--output-dir", type=str, default="./bc_component/outputs/ssmlp_js", help="Directory for checkpoints and logs.")
     parser.add_argument("--train-ratio", type=float, default=0.9, help="Segment-level train split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size. Reduce if you hit memory limits.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size. Reduce if you hit memory limits.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay.")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout in hidden layers.")
     parser.add_argument(
         "--hidden-dims",
         type=int,
         nargs="+",
-        default=[256, 256],
+        default=[128, 128, 128],
         help="Hidden layer sizes for the MLP.",
     )
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device to use: 'auto', 'cuda', or 'cpu'. 'auto' prefers CUDA when available.",
-    )
     return parser.parse_args()
 
 
@@ -82,77 +78,17 @@ class SplitSummary:
     val_samples: int
 
 
-class SingleStepGoalConditionedMLP(nn.Module):
-    """
-    Simple pointwise MLP baseline.
-
-    Maps:
-        (goal, current_state) -> next_state
-
-    Batch convention:
-        batch = {
-            "state": Tensor[B, state_dim],
-            "goal": Tensor[B, goal_dim],
-            "action_targets": Tensor[B, action_dim],
-        }
-    """
-
-    def __init__(
-        self,
-        state_dim: int,
-        goal_dim: int,
-        action_dim: int,
-        hidden_dims: Sequence[int] = (256, 256),
-        dropout: float = 0.0,
-        loss_func=F.mse_loss,
-    ) -> None:
-        super().__init__()
-
-        self.state_dim = state_dim
-        self.goal_dim = goal_dim
-        self.action_dim = action_dim
-        self.hidden_dims = list(hidden_dims)
-        self.dropout = dropout
-        self.loss_func = loss_func
-
-        dims = [state_dim + goal_dim, *hidden_dims, action_dim]
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.ReLU())
-                if dropout > 0.0:
-                    layers.append(nn.Dropout(dropout))
-        self.net = nn.Sequential(*layers)
-
-    def train_step(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        states = batch["state"]
-        goals = batch["goal"]
-
-        predicted_actions = self.forward(states, goals)
-
-        out = {"predicted_actions": predicted_actions}
-        action_targets = batch.get("action_targets")
-        if action_targets is not None:
-            loss = self.loss_func(predicted_actions, action_targets)
-            out["loss"] = loss
-        return out
-
-    def forward(self, state: Tensor, goal: Tensor) -> Tensor:
-        x = torch.cat([state, goal], dim=-1)
-        predicted_actions = self.net(x)
-        return predicted_actions
-
-
 class SingleStepSegmentDataset(Dataset):
     """
-    Segment-backed dataset that yields one-step transitions:
+    In-memory segment dataset that materializes the full split up front.
+
+    One supervised sample is:
         state_t -> target_{t+1}
 
-    Split is performed at the segment level before constructing the sample index.
+    Split is performed at the segment level before constructing the sample tensors.
     Segments with fewer than 2 valid steps are rejected, with explicit warnings.
 
-    Normalization is applied in the dataset:
+    Normalization is applied once during dataset construction:
       - trajectories are scaled from raw joint ranges into [-1, 1]
       - goals are normalized in grouped form over shape (3, 3), where the 3 coordinate
         dimensions share statistics across the 3 goal entries
@@ -173,8 +109,6 @@ class SingleStepSegmentDataset(Dataset):
         self.joint_raw_min = joint_raw_min.detach().clone().float()
         self.joint_raw_max = joint_raw_max.detach().clone().float()
         self.goal_norm = goal_norm
-        self._file = None
-        self.sample_index: List[Tuple[int, int]] = []
         self.rejected_segments: List[Tuple[int, int]] = []
 
         if self.joint_raw_min.shape != (4,) or self.joint_raw_max.shape != (4,):
@@ -185,6 +119,12 @@ class SingleStepSegmentDataset(Dataset):
         if not torch.all(self.joint_raw_max > self.joint_raw_min):
             raise ValueError("Every entry in joint_raw_max must be strictly greater than joint_raw_min.")
 
+        state_rows: List[Tensor] = []
+        target_rows: List[Tensor] = []
+        goal_rows: List[Tensor] = []
+        segment_id_rows: List[Tensor] = []
+        timestep_rows: List[Tensor] = []
+
         with h5py.File(self.path, "r") as f:
             goals = f["goals"]
             trajectories = f["trajectories"]
@@ -194,6 +134,17 @@ class SingleStepSegmentDataset(Dataset):
                 raise ValueError(
                     f"Expected trajectories with shape (S, N, 4), got {tuple(trajectories.shape)}"
                 )
+
+            sample_goal = goals[0]
+            flat_dim = int(torch.as_tensor(sample_goal).numel())
+            if flat_dim != 9:
+                raise ValueError(
+                    f"Expected goals to flatten to size 9, got stored shape {tuple(goals.shape[1:])}"
+                )
+
+            self.goal_dim = flat_dim
+            self.state_dim = 4
+            self.action_dim = 4
 
             for seg_idx in self.segment_indices:
                 seg_len = int(lengths[seg_idx])
@@ -206,28 +157,49 @@ class SingleStepSegmentDataset(Dataset):
                     )
                     continue
 
-                for t in range(seg_len - 1):
-                    self.sample_index.append((seg_idx, t))
+                traj = torch.from_numpy(trajectories[seg_idx, :seg_len]).float()
+                goal = torch.from_numpy(goals[seg_idx]).float()
 
-            sample_goal = goals[0]
-            flat_dim = int(torch.as_tensor(sample_goal).numel())
-            if flat_dim != 9:
-                raise ValueError(
-                    f"Expected goals to flatten to size 9, got stored shape {tuple(goals.shape[1:])}"
-                )
-            self.goal_dim = flat_dim
-            self.state_dim = 4
-            self.action_dim = 4
+                states = self._normalize_joint_tensor(traj[:-1])
+                targets = self._normalize_joint_tensor(traj[1:])
+                goal_row = self._normalize_goal(goal).unsqueeze(0).repeat(seg_len - 1, 1)
+
+                state_rows.append(states)
+                target_rows.append(targets)
+                goal_rows.append(goal_row)
+                segment_id_rows.append(torch.full((seg_len - 1,), seg_idx, dtype=torch.long))
+                timestep_rows.append(torch.arange(seg_len - 1, dtype=torch.long))
+
+        if state_rows:
+            self.states = torch.cat(state_rows, dim=0).contiguous()
+            self.action_targets = torch.cat(target_rows, dim=0).contiguous()
+            self.goals = torch.cat(goal_rows, dim=0).contiguous()
+            self.segment_ids = torch.cat(segment_id_rows, dim=0).contiguous()
+            self.timesteps = torch.cat(timestep_rows, dim=0).contiguous()
+        else:
+            self.states = torch.empty((0, 4), dtype=torch.float32)
+            self.action_targets = torch.empty((0, 4), dtype=torch.float32)
+            self.goals = torch.empty((0, 9), dtype=torch.float32)
+            self.segment_ids = torch.empty((0,), dtype=torch.long)
+            self.timesteps = torch.empty((0,), dtype=torch.long)
+
+        self.sample_index = list(zip(self.segment_ids.tolist(), self.timesteps.tolist()))
+        total_bytes = (
+            self.states.numel() * self.states.element_size()
+            + self.action_targets.numel() * self.action_targets.element_size()
+            + self.goals.numel() * self.goals.element_size()
+            + self.segment_ids.numel() * self.segment_ids.element_size()
+            + self.timesteps.numel() * self.timesteps.element_size()
+        )
+        print(
+            f"[{self.split_name}] loaded {len(self.states)} samples into RAM "
+            f"({total_bytes / 1024**3:.3f} GiB)"
+        )
 
     def __len__(self) -> int:
-        return len(self.sample_index)
+        return int(self.states.shape[0])
 
-    def _ensure_open(self):
-        if self._file is None:
-            self._file = h5py.File(self.path, "r")
-        return self._file
-
-    def _normalize_joint_vec(self, x: Tensor) -> Tensor:
+    def _normalize_joint_tensor(self, x: Tensor) -> Tensor:
         # Map raw joint values from [min, max] to [-1, 1] per dimension.
         x = x.float()
         return 2.0 * (x - self.joint_raw_min) / (self.joint_raw_max - self.joint_raw_min) - 1.0
@@ -244,39 +216,13 @@ class SingleStepSegmentDataset(Dataset):
         return g.squeeze(-1).t().reshape(-1)
 
     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
-        f = self._ensure_open()
-        seg_idx, t = self.sample_index[idx]
-
-        goal = torch.from_numpy(f["goals"][seg_idx]).float()
-        state = torch.from_numpy(f["trajectories"][seg_idx, t]).float()
-        target = torch.from_numpy(f["trajectories"][seg_idx, t + 1]).float()
-
-        goal = self._normalize_goal(goal)
-        state = self._normalize_joint_vec(state)
-        target = self._normalize_joint_vec(target)
-
         return {
-            "goal": goal,
-            "state": state,
-            "action_targets": target,
-            "segment_idx": torch.tensor(seg_idx, dtype=torch.long),
-            "t": torch.tensor(t, dtype=torch.long),
+            "goal": self.goals[idx],
+            "state": self.states[idx],
+            "action_targets": self.action_targets[idx],
+            "segment_idx": self.segment_ids[idx],
+            "t": self.timesteps[idx],
         }
-
-
-def choose_device(requested: str) -> torch.device:
-    requested = requested.lower()
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available.")
-        return torch.device("cuda")
-    if requested == "cpu":
-        return torch.device("cpu")
-    raise ValueError(f"Unsupported device option: {requested!r}")
 
 
 def seed_everything(seed: int) -> None:
@@ -373,38 +319,33 @@ def compute_goal_normalization_stats(
 
 
 def move_batch_to_device(batch: Dict[str, Tensor], device: torch.device) -> Dict[str, Tensor]:
-    moved: Dict[str, Tensor] = {}
-    for key, value in batch.items():
-        moved[key] = value.to(device, non_blocking=True)
-    return moved
+    states = batch["state"].to(device, non_blocking=True)
+    goals = batch["goal"].to(device, non_blocking=True)
+    actions = batch["action_targets"].to(device, non_blocking=True)
+    
+    return {"state": states, "goal": goals, "action_targets": actions}
 
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
-    total_mae = 0.0
     total_count = 0
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
-        out = model.train_step(batch)
-        loss = out["loss"]
-        preds = out["predicted_actions"]
+        loss = model.train_step(batch)
         targets = batch["action_targets"]
-        mae = F.l1_loss(preds, targets)
 
         batch_size = targets.shape[0]
         total_loss += float(loss.item()) * batch_size
-        total_mae += float(mae.item()) * batch_size
         total_count += batch_size
 
     if total_count == 0:
-        return {"loss": float("nan"), "mae": float("nan")}
+        return {"loss": float("nan")}
 
     return {
         "loss": total_loss / total_count,
-        "mae": total_mae / total_count,
     }
 
 
@@ -416,24 +357,19 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
-    total_mae = 0.0
     total_count = 0
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        out = model.train_step(batch)
-        loss = out["loss"]
-        preds = out["predicted_actions"]
+        loss : Tensor = model.train_step(batch)
         targets = batch["action_targets"]
-        mae = F.l1_loss(preds, targets)
 
         loss.backward()
         optimizer.step()
 
         batch_size = targets.shape[0]
         total_loss += float(loss.item()) * batch_size
-        total_mae += float(mae.item()) * batch_size
         total_count += batch_size
 
     if total_count == 0:
@@ -441,7 +377,6 @@ def train_one_epoch(
 
     return {
         "loss": total_loss / total_count,
-        "mae": total_mae / total_count,
     }
 
 
@@ -465,16 +400,39 @@ def save_checkpoint(
     )
 
 
+
+# ??? consider whether or not to implement this portion
+def normalize_goal_grouped(goal: Tensor, goal_mean_grouped: Tensor, goal_std_grouped: Tensor) -> Tensor:
+    """
+    Normalize goal coordinates with shared stats per coordinate index.
+
+    Goal is interpreted as logical shape (3, 3):
+      - all x-like entries share mean/std index 0
+      - all y-like entries share mean/std index 1
+      - all z-like entries share mean/std index 2
+    """
+    goal = goal.float().reshape(3, 3)
+    mean = goal_mean_grouped.float().reshape(1, 3)
+    std = goal_std_grouped.float().reshape(1, 3)
+    return ((goal - mean) / std).reshape(-1)
+
+def unnormalize_goal_grouped(goal: Tensor, goal_mean_grouped: Tensor, goal_std_grouped: Tensor) -> Tensor:
+    """Inverse of normalize_goal_grouped for logical shape (3, 3) goals."""
+    goal = goal.float().reshape(3, 3)
+    mean = goal_mean_grouped.float().reshape(1, 3)
+    std = goal_std_grouped.float().reshape(1, 3)
+    return (goal * std + mean).reshape(-1)
+
+
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_everything(args.seed)
-    device = choose_device(args.device)
-
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
 
     train_segments, val_segments, split_summary = build_segment_split(
         path=args.data,
@@ -522,11 +480,16 @@ def main() -> None:
         f"train_rejected={len(train_dataset.rejected_segments)}, val_rejected={len(val_dataset.rejected_segments)}"
     )
 
+    if args.num_workers != 0:
+        print(
+            f"Ignoring --num-workers={args.num_workers} because the full dataset is preloaded into RAM."
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
@@ -534,12 +497,12 @@ def main() -> None:
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
 
-    model = SingleStepGoalConditionedMLP(
+    model = SingleStepMLP(
         state_dim=train_dataset.state_dim,
         goal_dim=train_dataset.goal_dim,
         action_dim=train_dataset.action_dim,
@@ -584,12 +547,6 @@ def main() -> None:
             "goal_mode": "grouped_by_coordinate_across_3_entries",
             "target_uses_joint_scaling": True,
         },
-        "notes": {
-            "mapping": "(goal, trajectory[t]) -> trajectory[t+1]",
-            "joint_scaling_todo": "Replace JOINT_STATE_RAW_MIN and JOINT_STATE_RAW_MAX with the true raw joint limits before serious training.",
-            "future_batch_size": "for real GPU training, batch sizes like 512-4096 may be reasonable depending on dataset size and GPU memory",
-            "future_epochs": "for a stronger baseline, 20-100 epochs is more typical than 10",
-        },
         "split_summary": asdict(split_summary),
     }
 
@@ -607,16 +564,14 @@ def main() -> None:
         epoch_record = {
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
-            "train_mae": train_metrics["mae"],
             "val_loss": val_metrics["loss"],
-            "val_mae": val_metrics["mae"],
         }
         history.append(epoch_record)
 
         print(
             f"epoch {epoch:03d} | "
-            f"train_loss (mse)={train_metrics['loss']:.6f} train_mae={train_metrics['mae']:.6f} | "
-            f"val_loss (mse)={val_metrics['loss']:.6f} val_mae={val_metrics['mae']:.6f}"
+            f"train_loss (mse)={train_metrics['loss']:.6f} | "
+            f"val_loss (mse)={val_metrics['loss']:.6f}"
         )
 
         save_checkpoint(output_dir / "latest.pt", model, optimizer, epoch, history, config)

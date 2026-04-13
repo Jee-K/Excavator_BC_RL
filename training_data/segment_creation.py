@@ -7,7 +7,7 @@ import os
 
 KEYPOINT_GOAL_INDEX = 6
 
-def build_segments(trajectories: np.ndarray, keypoints_cylindrical, lead_frames_before_dig : int = 50, close_frames_before_reset : int = 0, bucket_flat_angle : float = 1.1) -> list[tuple[np.ndarray, np.ndarray]]:
+def build_segments(trajectories: np.ndarray, keypoints_cylindrical, lead_frames_before_dig : int = 20, close_frames_before_reset : int = 0, bucket_flat_angle : float = 1.1) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     With trajectories in Nx[base, boom, arm, scoop], lead frames and close frames being nonnegative ints, and bucket_flat_angle being a float-like representing radians
     """
@@ -64,24 +64,19 @@ def build_segments(trajectories: np.ndarray, keypoints_cylindrical, lead_frames_
         segments.append((last_dig_idx, dump_idx, idx))
         last_dig_idx = idx
 
-        labeled_segments = []
-        # segment_goals = []
-        # segment_trajs = []
+    labeled_segments = []
   
     for dig_idx, dump_idx, reset_idx in segments:
   
         start_idx = max(0, dig_idx - lead_frames_before_dig)
         seq_end_idx = int(np.clip(reset_idx + 1 - close_frames_before_reset, 0, len(trajectories)))
 
+        # !!! this pulls it in r, h, theta
         segment_goal = np.asarray([keypoints_cylindrical[dig_idx][KEYPOINT_GOAL_INDEX], keypoints_cylindrical[dump_idx][KEYPOINT_GOAL_INDEX], keypoints_cylindrical[reset_idx][KEYPOINT_GOAL_INDEX]], dtype=np.float32)
-        # segment_goals.append()
         segment_traj = np.asarray(trajectories[start_idx:seq_end_idx], dtype=np.float32)
-        # segment_trajs.append()
 
         labeled_segments.append((segment_goal, segment_traj))
 
-        # labeled_segments.append((keypoints_cylindrical[dig_idx], keypoints_cylindrical[dump_idx], keypoints_cylindrical[reset_idx], trajectories[start_idx:seq_end_idx]))
-    
     return labeled_segments
 
 
@@ -178,8 +173,8 @@ def build_segment_store(
 def main() -> None:
     output_file = build_segment_store(
         seq_data_path="./seq_data/",
-        output_path="./training_data/v1.h5",
-        manifest_path="./training_data/v1_manifest.txt",
+        output_path="./training_data/latest.h5",
+        manifest_path="./training_data/latest_manifest.txt",
         n_max=400,
     )
     print(f"Wrote segment store to: {output_file}")
