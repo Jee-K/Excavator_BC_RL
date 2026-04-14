@@ -51,9 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.9, help="Segment-level train split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size. Reduce if you hit memory limits.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=2048, help="Batch size. Reduce if you hit memory limits.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay.")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout in hidden layers.")
     parser.add_argument(

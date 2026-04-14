@@ -15,9 +15,6 @@ Fill in STARTING_POLICY_Q_RAW with a good 4-D start pose in raw joint space:
 
 The goal should remain a (3, 3) array, matching the training/inference code.
 """
-
-from __future__ import annotations
-
 from pathlib import Path
 import time
 from typing import Any, Iterable, Mapping, Optional, Sequence

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Iterable, Iterator
 import csv
@@ -690,13 +688,6 @@ def main() -> None:
         rotation_limit=ROTATION_LIMIT,
         rotation_step=ROTATION_STEP,
     )
-
-    print(f"Wrote segment store to: {output_file}")
-    print("Wrote spreadsheet-friendly exports:")
-    print(f"  summary_csv: {exports['summary_csv']}")
-    for flat_csv_path in exports["flat_csv_parts"]:
-        print(f"  flat_csv: {flat_csv_path}")
-    print(f"  manifest: {exports['manifest']}")
 
 
 if __name__ == "__main__":

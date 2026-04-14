@@ -323,17 +323,20 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init()
 
     preset = SIM_PRESETS["experimental"]
+    # r, h, theta # !!! obviously, these goals are bad
+    HARDCODED_GOAL = np.array([[.8,7.4940055485687E-17,0],[.8,7.4940055485687E-17,2],[.8,7.4940055485687E-17,0]], dtype=np.float32)
 
     sim_env = ExcavatorMPM(
         viewer,
         fidelity=preset,
-        debug=True
+        task=TaskInfo((3.0, -.8, 0), (4.0, 0.8, 0.5 * np.pi), (0.0, 0.55, 0.10, 0.55)),
+        # task=TaskInfo(HARDCODED_GOAL[0], HARDCODED_GOAL[1], (0.0, 0.55, 0.10, 0.55))
+        debug=False
     )
 
     COMMAND_HZ = 10
 
-    # r, h, theta # !!! obviously, these goals are bad
-    HARDCODED_GOAL = np.array([[.8,7.4940055485687E-17,0],[.8,7.4940055485687E-17,2],[.8,7.4940055485687E-17,0]], dtype=np.float32)
+    
 
     run_policy_loop(
         sim_env=sim_env,

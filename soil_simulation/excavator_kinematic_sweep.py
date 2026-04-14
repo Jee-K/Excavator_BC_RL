@@ -8,8 +8,6 @@ interpolation for smooth viewing. It does not add soil, a floor, or run any
 physics stepping.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 import time
 from typing import Iterable, Optional

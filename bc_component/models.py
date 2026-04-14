@@ -23,9 +23,6 @@ Shared batch convention for `step(...)` / training calls:
         "teacher_forcing_ratio": float,
     }
 """
-
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple, Union
 
