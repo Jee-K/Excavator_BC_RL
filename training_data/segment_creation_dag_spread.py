@@ -43,6 +43,12 @@ def find_candidates(
     # add the last position as a false-dig which will serve as a return for the last segment,
     # if no good dig exists
     candidates.append((len(trajectories), "Dig"))
+
+    # ??? Motivation here isn't perfect, but helps create some additional segments. Remove if the creation is particularly unstable or data large
+    # if the first candidate is not a dig, add a false-dig at 0
+    if len(candidates) > 0 and candidates[0][1] != "Dig":
+        candidates.insert(0, (0, "Dig"))
+
     return candidates
 
 
