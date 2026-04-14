@@ -40,30 +40,63 @@ class SoilProperties:
     # cohesion_pa: float = 4_000.0
     # interface_friction_mu: float = 0.45
     # internal_friction_mu: float = .65
-
-@dataclass(frozen=True)
-class EnvironmentPreset:
-    # excavator information, rotation largely excluded
-    excavator_position: tuple[float, float, float] = (0.0, 3.0, 1.1)
-    excavator_platform_height_m: float = 0.6
+    
+class TaskInfo:
     excavator_platform_size: tuple[float, float] = (3.2, 2.4)
 
     # this looks slightly better than the built-in ground in the rendered, even though they act the same
     ground_size: tuple[float, float] = (15.0, 15.0)
 
-    # goal information
-    bucket_center: tuple[float, float, float] = (-4.0, 3.0, 0.0)
-    bucket_inner_half: tuple[float, float, float] = (0.75, 1.5, 0.8)
+    bank_center_height_m: float = 0.45
+    bank_width_m: float = 2.0
+    bank_height_m: float = 0.6
+    
     bucket_wall_thickness: float = 0.1
+    bucket_height_m: float = 0.0
 
-    # spawn information
-    slope_angle_deg: float = 32.0
-    bank_height_m: float = 0.85
-    bank_width_m: float = 2.6
-    bank_length_m: float = 2.2
-    spawn_clearance_m: float = 0.025
-    bank_front_y: float = 1.10
-    bank_back_y: float = -1.10
+
+    def __init__(self, rht_dig, rht_dump, spawn_controls):
+        self.bank_radius_m: float = rht_dig[0]
+        self.bank_theta_rad: float = rht_dig[2]
+
+        self.excavator_platform_height_m: float = max(0, -rht_dig[1] - .25)
+
+        self.bucket_radius_m: float = rht_dump[0]
+        self.bucket_theta_rad: float = rht_dump[2]
+        self.bucket_inner_half: float = (0.8, 0.8, max(.2, rht_dump[1] - .2))
+
+        self.spawn_controls = spawn_controls
+
+
+    @staticmethod
+    def excavator_frame_position(r: float, h: float, theta_rad: float) -> tuple[float, float, float]:
+        """Convert excavator-frame (r, h, theta) coordinates into world-space (x, y, z).
+
+        The excavator base is anchored at world (0, 0), and theta=0 points along the
+        excavator's zero-angle forward direction, which matches world -Y.
+        Positive theta rotates toward world -X.
+        """
+        x = -r * np.sin(theta_rad)
+        y = -r * np.cos(theta_rad)
+        z = h
+        return (float(x), float(y), float(z))
+
+    def excavator_position_xyz(self) -> tuple[float, float, float]:
+        return (0.0, 0.0, self.excavator_platform_height_m + .5)
+
+    def bucket_center_xyz(self) -> tuple[float, float, float]:
+        return self.excavator_frame_position(
+            self.bucket_radius_m,
+            self.bucket_height_m,
+            self.bucket_theta_rad,
+        )
+
+    def bank_center_xyz(self) -> tuple[float, float, float]:
+        return self.excavator_frame_position(
+            self.bank_radius_m,
+            self.bank_center_height_m,
+            self.bank_theta_rad,
+        )
 
 @dataclass(frozen=True)
 class SimulationFidelity:
@@ -149,6 +182,7 @@ class ExcavatorMPM:
         self,
         viewer: newton.viewer,
         fidelity: SimulationFidelity,
+        task: TaskInfo,
         enable_cuda_graph: bool = True,
         debug: bool = False
     ):
@@ -156,7 +190,7 @@ class ExcavatorMPM:
         self.viewer = viewer
         self.device = wp.get_device()
         self.soil_info = SoilProperties()
-        self.env_info = EnvironmentPreset()
+        self.task_info = task
         self.fidelity = fidelity
 
         self.debug = debug
@@ -209,7 +243,7 @@ class ExcavatorMPM:
         control_start = len(builder.joint_target_ke)
         builder.add_urdf(
             excavator_urdf,
-            xform=wp.transform(wp.vec3(*self.env_info.excavator_position), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(*self.task_info.excavator_position_xyz()), wp.quat_identity()),
             floating=True,
             enable_self_collisions=False,
             collapse_fixed_joints=True,
@@ -232,12 +266,12 @@ class ExcavatorMPM:
         builder.joint_target_kd[6] = 1000.0
         builder.joint_target_ke[7] = 10000.0 # back boom needs some help
 
-        self.create_mpm_soil_bank(builder)
+        self.create_mpm_soil_rectangle(builder)
         self.add_ground_plane(builder)
         self.add_excavator_platform(builder)
 
-        self.bucket_center = np.asarray(self.env_info.bucket_center, dtype=np.float64)
-        self.bucket_inner_half = np.asarray(self.env_info.bucket_inner_half, dtype=np.float64)
+        self.bucket_center = np.asarray(self.task_info.bucket_center_xyz(), dtype=np.float64)
+        self.bucket_inner_half = np.asarray(self.task_info.bucket_inner_half, dtype=np.float64)
         self.add_dump_bucket(builder)
 
         self.model = builder.finalize()
@@ -263,7 +297,7 @@ class ExcavatorMPM:
             self.model,
             ls_iterations=self.fidelity.rigid_ls_iterations,
             njmax=self.fidelity.rigid_njmax,
-            ccd_iterations = 100,
+            ccd_iterations = 200,
         )
 
         self.mpm_solver = SolverImplicitMPM(self.model, mpm_options)
@@ -328,7 +362,7 @@ class ExcavatorMPM:
         builder.default_shape_cfg.mu = self.soil_info.interface_friction_mu
 
     def add_ground_plane(self, builder) -> None:
-        width, length = self.env_info.ground_size
+        width, length = self.task_info.ground_size
         builder.add_shape_plane(
             body=-1,
             cfg=self.static_ground_cfg,
@@ -338,12 +372,12 @@ class ExcavatorMPM:
         )
 
     def add_excavator_platform(self, builder) -> None:
-        width, length = self.env_info.excavator_platform_size
-        height = self.env_info.excavator_platform_height_m
+        width, length = self.task_info.excavator_platform_size
+        height = self.task_info.excavator_platform_height_m
         if height <= 0.0:
             return
 
-        ex, ey, _ = self.env_info.excavator_position
+        ex, ey, _ = self.task_info.excavator_position_xyz()
         builder.add_shape_box(
             body=-1,
             cfg=self.static_ground_cfg,
@@ -356,7 +390,7 @@ class ExcavatorMPM:
     def add_dump_bucket(self, builder) -> None:
         bx, by, bz = self.bucket_center
         iw, il, idepth = self.bucket_inner_half
-        t = self.env_info.bucket_wall_thickness
+        t = self.task_info.bucket_wall_thickness
         cfg = self.static_particle_contact_cfg
 
         builder.add_shape_box(
@@ -421,30 +455,22 @@ class ExcavatorMPM:
     #         "hardening": np.full(particle_count, hardening, dtype=np.float32),
     #     }
 
-    def create_mpm_soil_bank(self, builder : newton.ModelBuilder) -> None:
-        y_front = self.env_info.bank_front_y
-        y_back = self.env_info.bank_back_y
-        max_height = self.env_info.bank_height_m
-        z0 = self.env_info.spawn_clearance_m
-        slope_tan = np.tan(np.radians(self.env_info.slope_angle_deg))
+    def create_mpm_soil_rectangle(self, builder : newton.ModelBuilder) -> None:
+        cx, cy, cz = self.task_info.bank_center_xyz()
+        x_min = cx - 0.5 * self.task_info.bank_width_m
+        y_min = cy - 0.5 * self.task_info.bank_width_m
+        z_min = cz - 0.5 * self.task_info.bank_height_m
+        z_max = cz + 0.5 * self.task_info.bank_height_m
 
-        nx = int(np.ceil(self.env_info.bank_width_m / self.voxel_size))
-        ny = int(np.ceil(self.env_info.bank_length_m / self.voxel_size))
-        nz = int(np.ceil((max_height + z0 + self.voxel_size) / self.voxel_size))
+        nx = int(np.ceil(self.task_info.bank_width_m / self.voxel_size))
+        ny = int(np.ceil(self.task_info.bank_width_m / self.voxel_size))
+        nz = int(np.ceil((z_max - z_min) / self.voxel_size))
 
-        xs = -0.5 * self.env_info.bank_width_m + np.arange(nx, dtype=np.float32) * self.voxel_size
-        ys = y_back + np.arange(ny, dtype=np.float32) * self.voxel_size
-        zs = z0 + np.arange(nz, dtype=np.float32) * self.voxel_size
+        xs = x_min + np.arange(nx, dtype=np.float32) * self.voxel_size
+        ys = y_min + np.arange(ny, dtype=np.float32) * self.voxel_size
+        zs = z_min + np.arange(nz, dtype=np.float32) * self.voxel_size
 
-        cell_origins = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
-        depth_into_bank = np.maximum(0.0, y_front - cell_origins[:, 1])
-        local_height = np.minimum(max_height, depth_into_bank * slope_tan)
-        occupancy_mask = (
-            (cell_origins[:, 1] >= y_back)
-            & (cell_origins[:, 1] <= y_front)
-            & (cell_origins[:, 2] <= z0 + local_height)
-        )
-        occupied_cells = cell_origins[occupancy_mask].astype(np.float32, copy=False)
+        occupied_cells = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3).astype(np.float32, copy=False)
 
         rng = np.random.default_rng(7)
         jitter = rng.random((occupied_cells.shape[0], 1, 3), dtype=np.float32) * self.voxel_size
@@ -640,14 +666,13 @@ class ExcavatorMPM:
 
     # Controller
     def apply_control(self, user_targets : list[float, float, float, float] | None = None) -> None:
-        if not user_targets:
+        if not user_targets and self.sim_time >= self.settle_duration:
             return
 
         targets = self._joint_target_host.copy()
-        
 
         if self.sim_time < self.settle_duration:
-            user_targets = [0.0, 0.55, 0.10, 0.55]
+            user_targets = self.task_info.spawn_controls
 
         q_prevs = self.state_0.joint_q.numpy()
 
@@ -682,7 +707,7 @@ class ExcavatorMPM:
         positions = self.state_0.particle_q.numpy()
         bx, by, bz = self.bucket_center
         iw, il, idepth = self.bucket_inner_half
-        t = self.env_info.bucket_wall_thickness
+        t = self.task_info.bucket_wall_thickness
         inside = (
             (positions[:, 0] >= bx - iw)
             & (positions[:, 0] <= bx + iw)
@@ -730,7 +755,8 @@ def main() -> None:
     sim_env = ExcavatorMPM(
         viewer,
         fidelity=preset,
-        debug=True
+        task=TaskInfo((3.0, -.8, 0), (4.0, 0.8, 0.5 * np.pi), (0.0, 0.55, 0.10, 0.55)),
+        debug=False
     )
 
     COMMAND_HZ = 10
