@@ -6,7 +6,7 @@ import os
 import h5py
 import numpy as np
 
-KEYPOINT_GOAL_INDEX = 6
+KEYPOINT_GOAL_INDEX = 0 # 0 - scoop tip, 1 - scoop middle, 2 - scoop base
 ROTATION_LIMIT = 1.5 * np.pi
 ROTATION_STEP = 0.1
 EXCEL_ROW_LIMIT = 1_048_576
@@ -177,7 +177,7 @@ def iter_joint_angle_files(source_dirs: Iterable[str | Path]) -> Iterator[Path]:
         seq_root = root / "sequences"
         if not seq_root.is_dir():
             continue
-        yield from sorted(seq_root.rglob("joint_angles.npz"))
+        yield from sorted(seq_root.rglob("joint_angles_v2.npz"))
 
 
 
@@ -666,8 +666,8 @@ def main() -> None:
 
     output_file = build_segment_store(
         seq_data_path="./seq_data/",
-        output_path=training_dir / "dag.h5",
-        manifest_path=training_dir / "dag_manifest.txt",
+        output_path=training_dir / "new_data_form.h5",
+        manifest_path=training_dir / "new_data_form_manifest.txt",
         n_max=400,
         lead_frames_before_dig=20,
         close_frames_before_reset=0,
@@ -680,7 +680,7 @@ def main() -> None:
     exports = write_segment_csv_exports(
         seq_data_path="./seq_data/",
         output_dir=training_dir,
-        output_prefix="dag",
+        output_prefix="new_data_form",
         lead_frames_before_dig=20,
         close_frames_before_reset=0,
         bucket_flat_angle=1.1,
