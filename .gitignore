@@ -12,3 +12,5 @@ seq_data/*/*
 *.h5
 training_data/*.txt
 bc_component/outputs
+output_model/
+/*.py
