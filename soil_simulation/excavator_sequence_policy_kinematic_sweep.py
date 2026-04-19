@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-Physics-less excavator policy rollout.
+Physics-less excavator sequence-policy rollout.
 
-This is a standalone simulator-side script: it loads the excavator URDF,
-loads a trained single-step MLP policy checkpoint, and drives the excavator
-kinematically from policy outputs without stepping physics.
+This is the sequence-model analogue of the single-step kinematic sweep runner:
+- load the excavator URDF,
+- load a trained sequence policy checkpoint (MLP / LSTM / ACT-style),
+- drive the excavator kinematically from policy outputs without stepping physics,
+- query the policy at COMMAND_HZ,
+- linearly interpolate between command targets for smoother viewing at VIEWER_FPS.
 
-The viewer runs at VIEWER_FPS, while the policy is queried at COMMAND_HZ.
-Between policy commands, joint targets are linearly interpolated for smooth
-viewing.
+Inference behavior matches `run_sequence_policy.py`:
+- maintain a rolling command-time history of observed 4-D joint states,
+- left-pad the history and emit a mask until enough states are seen,
+- predict a future chunk,
+- apply only the FIRST predicted action at each command tick.
 
-Fill in STARTING_POLICY_Q_RAW with a good 4-D start pose in raw joint space:
+Fill in STARTING_POLICY_Q_RAW with a good 4-D raw joint pose:
     [swing, arm, stick, bucket]
 
-The goal should remain a (3, 3) array, matching the training/inference code.
+The goal must remain shape (3, 3), matching the training/inference code.
 """
+
+from collections import deque
 from pathlib import Path
 import time
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -27,9 +34,11 @@ import warp as wp
 import newton
 import newton.examples
 
+from models import ACTStylePolicy, GoalConditionedMLPPolicy, LSTMSeq2SeqPolicy
+
 
 URDF_RELATIVE_PATH = "./excavatorURDF/excavator_lowpoly_locked_splitbucket.urdf"
-CHECKPOINT_DIR = "./bc_component/outputs/new_mae"
+CHECKPOINT_DIR = "./bc_component/outputs/emlp_large_batch"
 CHECKPOINT_NAME = "best.pt"
 
 VIEWER_FPS = 60.0
@@ -39,48 +48,38 @@ COMMAND_HZ = 10.0
 STARTING_POLICY_Q_RAW = np.array([
     0.0,
     0.0,
-    -.9,
+    -0.9,
     0.8,
 ], dtype=np.float32)
 
 # Replace with your desired goal if needed. Shape must be (3, 3).
-HARDCODED_GOAL = np.array([[3.0,-.8,0],[4.0, 0.8, 0.5 * np.pi],[3.0, -.8, 0]], dtype=np.float32)
+HARDCODED_GOAL = np.array([
+    [3.0, -0.8, 0.0],
+    [4.0, 0.8, 0.5 * np.pi],
+    [3.0, -0.8, 0.0],
+], dtype=np.float32)
+
+POLICY_TYPE_TO_NAME = {
+    "GoalConditionedMLPPolicy": "mlp",
+    "LSTMSeq2SeqPolicy": "lstm",
+    "ACTStylePolicy": "act",
+}
 
 
-class SingleStepMLP(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        goal_dim: int,
-        action_dim: int,
-        hidden_dims: Sequence[int],
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        dims = [state_dim + goal_dim, *hidden_dims, action_dim]
-        layers: list[nn.Module] = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.ReLU())
-                if dropout > 0.0:
-                    layers.append(nn.Dropout(dropout))
-        self.net = nn.Sequential(*layers)
+def choose_device(requested: str | torch.device = "auto") -> torch.device:
+    if isinstance(requested, torch.device):
+        return requested
 
-    def forward(self, state: Tensor, goal: Tensor) -> Tensor:
-        x = torch.cat([state, goal], dim=-1)
-        return self.net(x)
-
-
-def choose_device(requested: str = "auto") -> torch.device:
     requested_l = str(requested).lower()
+    if requested_l == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if requested_l == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("Requested device 'cuda' but CUDA is not available.")
+            raise RuntimeError("Requested device='cuda' but CUDA is not available.")
         return torch.device("cuda")
     if requested_l == "cpu":
         return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raise ValueError(f"Unsupported device request: {requested!r}. Use 'auto', 'cuda', or 'cpu'.")
 
 
 def _as_float_tensor(x: Any, device: torch.device | None = None) -> Tensor:
@@ -98,11 +97,110 @@ def unscale_joint_from_unit(unit: Tensor, raw_min: Tensor, raw_max: Tensor) -> T
     return 0.5 * (unit + 1.0) * (raw_max - raw_min) + raw_min
 
 
-class JointScaledSSMLPPolicy:
+def _extract_norm_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    norm_cfg = config.get("normalization")
+    if norm_cfg is None:
+        raise KeyError("Checkpoint config does not contain a 'normalization' section.")
+
+    required_keys = [
+        "joint_raw_min",
+        "joint_raw_max",
+        "goal_mean_grouped",
+        "goal_std_grouped",
+    ]
+    missing = [k for k in required_keys if k not in norm_cfg]
+    if missing:
+        raise KeyError(f"Checkpoint normalization config is missing keys: {missing}")
+    return norm_cfg
+
+
+def _extract_model_choice(config: Mapping[str, Any], model_cfg: Mapping[str, Any]) -> str:
+    policy_type = model_cfg.get("policy_type")
+    if policy_type in POLICY_TYPE_TO_NAME:
+        return POLICY_TYPE_TO_NAME[str(policy_type)]
+
+    model_choice = config.get("model_choice")
+    if model_choice in {"mlp", "lstm", "act"}:
+        return str(model_choice)
+
+    raise KeyError(
+        "Could not infer model type from checkpoint config. Expected model['policy_type'] "
+        "or config['model_choice'] to identify one of: mlp, lstm, act."
+    )
+
+
+def build_model_from_config(config: Mapping[str, Any]) -> nn.Module:
+    model_cfg = config.get("model")
+    if model_cfg is None:
+        raise KeyError("Checkpoint config does not contain a 'model' section.")
+
+    model_name = _extract_model_choice(config, model_cfg)
+
+    common = dict(
+        state_dim=int(model_cfg["state_dim"]),
+        goal_dim=int(model_cfg["goal_dim"]),
+        action_dim=int(model_cfg["action_dim"]),
+        history_len=int(model_cfg["history_len"]),
+        action_horizon=int(model_cfg["action_horizon"]),
+    )
+
+    if model_name == "mlp":
+        return GoalConditionedMLPPolicy(
+            **common,
+            hidden_dims=model_cfg["hidden_dims"],
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            loss_type=str(model_cfg.get("loss_type", "smooth_l1")),
+        )
+
+    if model_name == "lstm":
+        return LSTMSeq2SeqPolicy(
+            **common,
+            encoder_hidden_dim=int(model_cfg.get("encoder_hidden_dim", 256)),
+            decoder_hidden_dim=int(model_cfg.get("decoder_hidden_dim", 256)),
+            num_layers=int(model_cfg.get("num_layers", 2)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            default_teacher_forcing_ratio=float(model_cfg.get("default_teacher_forcing_ratio", 0.0)),
+            loss_type=str(model_cfg.get("loss_type", "smooth_l1")),
+        )
+
+    if model_name == "act":
+        return ACTStylePolicy(
+            **common,
+            d_model=int(model_cfg.get("d_model", 256)),
+            latent_dim=int(model_cfg.get("latent_dim", 32)),
+            nhead=int(model_cfg.get("nhead", 8)),
+            num_encoder_layers=int(model_cfg.get("num_encoder_layers", 4)),
+            num_decoder_layers=int(model_cfg.get("num_decoder_layers", 3)),
+            ff_dim=int(model_cfg.get("ff_dim", 512)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            kl_weight=float(model_cfg.get("kl_weight", 1e-4)),
+            recon_loss_type=str(model_cfg.get("recon_loss_type", "smooth_l1")),
+            sample_prior_at_inference=bool(model_cfg.get("sample_prior_at_inference", False)),
+        )
+
+    raise ValueError(f"Unsupported model type: {model_name!r}")
+
+
+class SequenceChunkPolicy:
+    """
+    Thin inference wrapper around a trained sequence goal-conditioned policy.
+
+    The policy expects:
+        raw current joint positions -> selected down to the 4 policy joints if needed,
+        then scaled to [-1, 1]
+        raw goal in shape (3, 3) or flattenable to 9 values -> grouped-normalized
+
+    It returns:
+        one raw next-step target joint position vector in shape (4,), chosen as the first
+        step from the predicted action chunk.
+    """
+
     def __init__(
         self,
         model: nn.Module,
         device: torch.device,
+        history_len: int,
+        action_horizon: int,
         joint_raw_min: Tensor,
         joint_raw_max: Tensor,
         goal_mean_grouped: Tensor,
@@ -112,6 +210,8 @@ class JointScaledSSMLPPolicy:
     ) -> None:
         self.model = model
         self.device = device
+        self.history_len = int(history_len)
+        self.action_horizon = int(action_horizon)
         self.joint_raw_min = _as_float_tensor(joint_raw_min, device)
         self.joint_raw_max = _as_float_tensor(joint_raw_max, device)
         self.goal_norm = Normalize(
@@ -120,14 +220,22 @@ class JointScaledSSMLPPolicy:
         )
         self.joint_indices = list(joint_indices) if joint_indices is not None else None
         self.clamp_output = clamp_output
+        self.history: deque[Tensor] = deque(maxlen=self.history_len)
 
         if self.joint_raw_min.shape != (4,) or self.joint_raw_max.shape != (4,):
             raise ValueError(
-                "Expected joint_raw_min and joint_raw_max to each have shape (4,), "
-                f"got {tuple(self.joint_raw_min.shape)} and {tuple(self.joint_raw_max.shape)}"
+                f"Expected joint_raw_min and joint_raw_max to each have shape (4,), got "
+                f"{tuple(self.joint_raw_min.shape)} and {tuple(self.joint_raw_max.shape)}"
             )
         if not torch.all(self.joint_raw_max > self.joint_raw_min):
             raise ValueError("Every entry in joint_raw_max must be strictly greater than joint_raw_min.")
+        if self.history_len <= 0:
+            raise ValueError(f"history_len must be positive, got {self.history_len}")
+        if self.action_horizon <= 0:
+            raise ValueError(f"action_horizon must be positive, got {self.action_horizon}")
+
+    def reset_history(self) -> None:
+        self.history.clear()
 
     def preprocess_goal(self, goal: np.ndarray | Sequence[float] | Tensor) -> Tensor:
         goal_t = _as_float_tensor(goal, self.device)
@@ -156,7 +264,47 @@ class JointScaledSSMLPPolicy:
 
         q_t = _as_float_tensor(q, self.device)
         q_t = scale_joint_to_unit(q_t, self.joint_raw_min, self.joint_raw_max)
-        return q_t.unsqueeze(0)
+        return q_t
+
+    def _append_state(self, state_unit: Tensor) -> None:
+        self.history.append(state_unit.detach().clone())
+
+    def _build_history_tensors(self) -> tuple[Tensor, Tensor]:
+        state_dim = int(self.joint_raw_min.numel())
+        history = torch.zeros((self.history_len, state_dim), dtype=torch.float32, device=self.device)
+        history_mask = torch.zeros((self.history_len,), dtype=torch.bool, device=self.device)
+
+        valid_len = len(self.history)
+        if valid_len > 0:
+            stacked = torch.stack(list(self.history), dim=0)
+            history[-valid_len:] = stacked
+            history_mask[-valid_len:] = True
+
+        return history.unsqueeze(0), history_mask.unsqueeze(0)
+
+    @torch.no_grad()
+    def predict_chunk(
+        self,
+        current_joint_positions: np.ndarray | Sequence[float] | Tensor,
+        goal: np.ndarray | Sequence[float] | Tensor,
+    ) -> np.ndarray:
+        state_t = self.preprocess_state(current_joint_positions)
+        self._append_state(state_t)
+        state_history, history_mask = self._build_history_tensors()
+        goal_t = self.preprocess_goal(goal)
+
+        batch = {
+            "state_history": state_history,
+            "history_mask": history_mask,
+            "goal": goal_t,
+            "start_action": state_t.unsqueeze(0),
+        }
+        out = self.model(batch)
+        pred_unit = out["predicted_actions"].squeeze(0)
+        pred_raw = unscale_joint_from_unit(pred_unit, self.joint_raw_min, self.joint_raw_max)
+        if self.clamp_output:
+            pred_raw = torch.clamp(pred_raw, min=self.joint_raw_min, max=self.joint_raw_max)
+        return pred_raw.detach().cpu().numpy()
 
     @torch.no_grad()
     def act(
@@ -164,39 +312,17 @@ class JointScaledSSMLPPolicy:
         current_joint_positions: np.ndarray | Sequence[float] | Tensor,
         goal: np.ndarray | Sequence[float] | Tensor,
     ) -> np.ndarray:
-        state_t = self.preprocess_state(current_joint_positions)
-        goal_t = self.preprocess_goal(goal)
-        pred_unit = self.model(state_t, goal_t).squeeze(0)
-        pred_raw = unscale_joint_from_unit(pred_unit, self.joint_raw_min, self.joint_raw_max)
-        if self.clamp_output:
-            pred_raw = torch.clamp(pred_raw, min=self.joint_raw_min, max=self.joint_raw_max)
-        return pred_raw.detach().cpu().numpy()
+        pred_chunk = self.predict_chunk(current_joint_positions, goal)
+        return pred_chunk[0]
 
 
-def _extract_norm_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    norm_cfg = config.get("normalization")
-    if norm_cfg is None:
-        raise KeyError("Checkpoint config does not contain a 'normalization' section.")
-
-    required_keys = [
-        "joint_raw_min",
-        "joint_raw_max",
-        "goal_mean_grouped",
-        "goal_std_grouped",
-    ]
-    missing = [k for k in required_keys if k not in norm_cfg]
-    if missing:
-        raise KeyError(f"Checkpoint normalization config is missing keys: {missing}")
-    return norm_cfg
-
-
-def load_ssmlp_policy(
+def load_sequence_policy(
     checkpoint_dir: str | Path,
     which: str = "best.pt",
-    device: str = "auto",
+    device: str | torch.device = "auto",
     joint_indices: Sequence[int] | None = None,
     clamp_output: bool = True,
-) -> JointScaledSSMLPPolicy:
+) -> SequenceChunkPolicy:
     device_obj = choose_device(device)
     checkpoint_path = Path(checkpoint_dir) / which
     ckpt = torch.load(checkpoint_path, map_location=device_obj)
@@ -207,22 +333,17 @@ def load_ssmlp_policy(
         )
 
     config = ckpt["config"]
-    model_cfg = config["model"]
     norm_cfg = _extract_norm_config(config)
-
-    model = SingleStepMLP(
-        state_dim=int(model_cfg["state_dim"]),
-        goal_dim=int(model_cfg["goal_dim"]),
-        action_dim=int(model_cfg["action_dim"]),
-        hidden_dims=model_cfg["hidden_dims"],
-        dropout=float(model_cfg.get("dropout", 0.0)),
-    ).to(device_obj)
+    model = build_model_from_config(config).to(device_obj)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    return JointScaledSSMLPPolicy(
+    model_cfg = config["model"]
+    return SequenceChunkPolicy(
         model=model,
         device=device_obj,
+        history_len=int(model_cfg["history_len"]),
+        action_horizon=int(model_cfg["action_horizon"]),
         joint_raw_min=_as_float_tensor(norm_cfg["joint_raw_min"]),
         joint_raw_max=_as_float_tensor(norm_cfg["joint_raw_max"]),
         goal_mean_grouped=_as_float_tensor(norm_cfg["goal_mean_grouped"]),
@@ -232,13 +353,13 @@ def load_ssmlp_policy(
     )
 
 
-class ExcavatorPolicyKinematicSweep:
+class ExcavatorSequencePolicyKinematicSweep:
     def __init__(self, viewer) -> None:
         self.viewer = viewer
         self.device = wp.get_device()
 
-        self.urdf_path = (URDF_RELATIVE_PATH)
-        self.checkpoint_dir = (CHECKPOINT_DIR)
+        self.urdf_path = Path(URDF_RELATIVE_PATH)
+        self.checkpoint_dir = Path(CHECKPOINT_DIR)
 
         self.frame_dt = 1.0 / VIEWER_FPS
         self.command_dt = 1.0 / COMMAND_HZ
@@ -268,13 +389,14 @@ class ExcavatorPolicyKinematicSweep:
         self.joint_map = self._identify_joint_map()
         self.policy_joint_indices = self._policy_joint_indices_from_map()
 
-        self.policy = load_ssmlp_policy(
+        self.policy = load_sequence_policy(
             checkpoint_dir=self.checkpoint_dir,
             which=CHECKPOINT_NAME,
             device="auto",
             joint_indices=None,
             clamp_output=True,
         )
+        self.policy.reset_history()
 
         self.current_policy_q = np.asarray(STARTING_POLICY_Q_RAW, dtype=np.float32).copy()
         if self.current_policy_q.shape != (4,):
@@ -284,6 +406,7 @@ class ExcavatorPolicyKinematicSweep:
 
         self.command_start_q = self.current_policy_q.copy()
         self.command_target_q = self.current_policy_q.copy()
+        self.last_predicted_chunk: Optional[np.ndarray] = None
 
         self._apply_policy_joints(self.current_policy_q)
 
@@ -294,6 +417,7 @@ class ExcavatorPolicyKinematicSweep:
         self.viewer.show_cloth = False
 
         print(f"Loaded URDF: {self.urdf_path}")
+        print(f"Checkpoint dir: {self.checkpoint_dir}")
         print(f"Joint map: {self.joint_map}")
         print(f"Policy joint indices: {self.policy_joint_indices}")
         print(f"Starting policy q: {self.current_policy_q}")
@@ -360,7 +484,10 @@ class ExcavatorPolicyKinematicSweep:
         return {k: (v if v is not None and v < self.control_size else None) for k, v in resolved.items()}
 
     def _policy_joint_indices_from_map(self) -> list[int]:
-        return [0, 1, 2, 3]
+        ordered = [self.joint_map[key] for key in ("swing", "arm", "stick", "bucket")]
+        if any(idx is None for idx in ordered):
+            raise RuntimeError(f"Failed to resolve all policy joints from joint map: {self.joint_map}")
+        return [int(idx) for idx in ordered]
 
     def _clip_target(self, index: Optional[int], value: float) -> float:
         if index is None:
@@ -386,17 +513,21 @@ class ExcavatorPolicyKinematicSweep:
 
     def _advance_policy(self) -> None:
         current_joint_positions = self.current_policy_q.copy()
-        next_q = np.asarray(
-            self.policy.act(current_joint_positions, HARDCODED_GOAL),
+        pred_chunk = np.asarray(
+            self.policy.predict_chunk(current_joint_positions, HARDCODED_GOAL),
             dtype=np.float32,
         )
+        if pred_chunk.ndim != 2 or pred_chunk.shape[1] != 4:
+            raise ValueError(f"Policy returned chunk with shape {pred_chunk.shape}, expected (K, 4)")
+
+        next_q = pred_chunk[0]
+        self.last_predicted_chunk = pred_chunk
 
         print()
-        print(current_joint_positions)
-        print(next_q)
-
-        if next_q.shape != (4,):
-            raise ValueError(f"Policy returned shape {next_q.shape}, expected (4,)")
+        print("current:", current_joint_positions)
+        print("next:", next_q)
+        print("chunk:")
+        print(pred_chunk)
 
         self.command_start_q = self.current_policy_q.copy()
         self.command_target_q = next_q
@@ -425,7 +556,7 @@ class ExcavatorPolicyKinematicSweep:
 
 def main() -> None:
     viewer, _args = newton.examples.init()
-    example = ExcavatorPolicyKinematicSweep(viewer)
+    example = ExcavatorSequencePolicyKinematicSweep(viewer)
 
     next_frame = time.perf_counter()
     while viewer.is_running():

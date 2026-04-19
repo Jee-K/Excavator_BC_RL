@@ -432,7 +432,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_everything(args.seed)
-    device = torch.device("cuda")
+    device = torch.device("cuda:0")
 
     train_segments, val_segments, split_summary = build_segment_split(
         path=args.data,
@@ -508,6 +508,7 @@ def main() -> None:
         action_dim=train_dataset.action_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
+        loss_func=F.l1_loss,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -534,7 +535,7 @@ def main() -> None:
             "action_dim": train_dataset.action_dim,
             "hidden_dims": list(args.hidden_dims),
             "dropout": args.dropout,
-            "loss_type": "mse",
+            "loss_type": "l1_loss", # !!! adjust
         },
         "normalization": {
             "joint_mode": "raw_joint_limits_to_-1_1",
@@ -570,8 +571,8 @@ def main() -> None:
 
         print(
             f"epoch {epoch:03d} | "
-            f"train_loss (mse)={train_metrics['loss']:.6f} | "
-            f"val_loss (mse)={val_metrics['loss']:.6f}"
+            f"train_loss={train_metrics['loss']:.6f} | "
+            f"val_loss={val_metrics['loss']:.6f}"
         )
 
         save_checkpoint(output_dir / "latest.pt", model, optimizer, epoch, history, config)
@@ -587,7 +588,6 @@ def main() -> None:
         json.dump(config, f, indent=2)
 
     print(f"Finished. Wrote outputs to: {output_dir}")
-    print("Saved: latest.pt, best.pt, history.json, summary.json")
 
 
 if __name__ == "__main__":

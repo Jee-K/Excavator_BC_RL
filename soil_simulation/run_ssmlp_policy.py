@@ -324,7 +324,7 @@ if __name__ == "__main__":
 
     preset = SIM_PRESETS["experimental"]
     # r, h, theta # !!! obviously, these goals are bad
-    HARDCODED_GOAL = np.array([[.8,7.4940055485687E-17,0],[.8,7.4940055485687E-17,2],[.8,7.4940055485687E-17,0]], dtype=np.float32)
+    HARDCODED_GOAL = np.array([[3.0,-.8,0],[4.0, 0.8, 0.5 * np.pi],[3.0, -.8, 0]], dtype=np.float32)
 
     sim_env = ExcavatorMPM(
         viewer,
@@ -343,7 +343,7 @@ if __name__ == "__main__":
         viewer=viewer,
         preset=preset,
         goal=HARDCODED_GOAL,
-        checkpoint_dir='./bc_component/outputs/ssmlp_js_dag',
+        checkpoint_dir='./bc_component/outputs/new_mse',
         which='best.pt',
         command_hz=10,
         joint_indices=[6, 7, 8, 9],
