@@ -9,21 +9,20 @@ Rewritten for a VRAM-first training flow:
 - batch by indexing already-resident GPU tensors
 - show tqdm bar-style progress for train/val each epoch
 
-This trainer supports the three sequence policies defined in models.py:
+This trainer supports the three sequence policies defined in models_phased.py:
     - GoalConditionedMLPPolicy
     - LSTMSeq2SeqPolicy
     - ACTStylePolicy
 
 Assumptions carried over from the original sequence trainer:
 - Input data lives in an HDF5 segment store with datasets:
-    goals:        (S, 9) or (S, 3, 3)
+    goals:        (S, goal_dim) reduced per-stream goals; in the current setup goal_dim=2
     trajectories: (S, N_max, 4)
     lengths:      (S,)
 - Trajectories serve as both the state-history source and the future target source.
 - Train/val split is performed by segment, before sample extraction.
 - Joint states/targets are normalized to [-1, 1] using explicit raw min/max constants.
-- Goals are normalized using torchvision.transforms.Normalize with grouped statistics
-  computed on the train split only.
+- Goals are normalized independently per reduced goal component using train-split statistics only.
 - CUDA is assumed to be available.
 
 Supervised sample formation:
@@ -51,10 +50,16 @@ import h5py
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torchvision.transforms import Normalize
+
+
 from tqdm.auto import tqdm
 
-from models import ACTStylePolicy, GoalConditionedMLPPolicy, LSTMSeq2SeqPolicy
+from models_phased import (
+    ACTStylePolicy,
+    BEHAVIOR_STREAM_CHOICES,
+    GoalConditionedMLPPolicy,
+    LSTMSeq2SeqPolicy,
+)
 
 
 # Prenormalization values carried over from the single-step trainer.
@@ -63,6 +68,7 @@ JOINT_STATE_RAW_MAX = torch.tensor([1.5 * np.pi, 1.0, 0.3, 0.873], dtype=torch.f
 
 MODEL_CHOICES = ("mlp", "lstm", "act")
 LOSS_TYPE_CHOICES = ("mse", "smooth_l1", "huber")
+BEHAVIOR_STREAM_SELECTION_CHOICES = (*BEHAVIOR_STREAM_CHOICES, "all")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.9, help="Segment-level train split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for GPU-side batching.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay.")
@@ -184,12 +190,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sample from the latent prior at inference time instead of using zeros.",
     )
+    parser.add_argument(
+        "--behavior-stream",
+        type=str,
+        default="all",
+        choices=BEHAVIOR_STREAM_SELECTION_CHOICES,
+        help="Which behavior stream to train: one stream or all labeled streams sequentially.",
+    )
     return parser.parse_args()
 
 
 @dataclass
 class SplitSummary:
-    total_segments: int
+    behavior_stream: str
+    total_segments_in_file: int
+    matching_behavior_segments: int
     accepted_segments: int
     rejected_segments: int
     train_segments: int
@@ -315,6 +330,41 @@ def normalize_joint_tensor(x: Tensor, joint_raw_min: Tensor, joint_raw_max: Tens
     return 2.0 * (x - joint_raw_min) / (joint_raw_max - joint_raw_min) - 1.0
 
 
+def normalize_goal_components(goal: Tensor, goal_mean: Tensor, goal_std: Tensor) -> Tensor:
+    goal = goal.float().reshape(-1)
+    goal_mean = goal_mean.to(device=goal.device, dtype=goal.dtype).reshape(-1)
+    goal_std = goal_std.to(device=goal.device, dtype=goal.dtype).reshape(-1)
+    if goal.shape != goal_mean.shape or goal.shape != goal_std.shape:
+        raise ValueError(
+            f"Goal normalization shapes must match exactly: goal={tuple(goal.shape)}, "
+            f"goal_mean={tuple(goal_mean.shape)}, goal_std={tuple(goal_std.shape)}"
+        )
+    return (goal - goal_mean) / goal_std
+
+
+def _decode_behavior_stream_label(raw: object) -> str:
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8").strip()
+    if hasattr(raw, "decode"):
+        return raw.decode("utf-8").strip()
+    return str(raw).strip()
+
+
+def load_behavior_stream_labels(path: str | Path) -> list[str]:
+    with h5py.File(path, "r") as f:
+        num_segments = int(f["goals"].shape[0])
+        labels_ds = f.get("behavior_stream_labels")
+        if labels_ds is None:
+            return ["full_cycle"] * num_segments
+        return [_decode_behavior_stream_label(x) for x in labels_ds[:]]
+
+
+def resolve_behavior_streams(selection: str) -> list[str]:
+    if selection == "all":
+        return list(BEHAVIOR_STREAM_CHOICES)
+    return [selection]
+
+
 def materialize_sequence_split(
     path: str | Path,
     segment_indices: Iterable[int],
@@ -323,7 +373,8 @@ def materialize_sequence_split(
     action_horizon: int,
     joint_raw_min: Tensor,
     joint_raw_max: Tensor,
-    goal_norm: Optional[Normalize] = None,
+    goal_mean: Optional[Tensor] = None,
+    goal_std: Optional[Tensor] = None,
 ) -> MaterializedSequenceSplit:
     segment_indices = list(segment_indices)
     joint_raw_min = joint_raw_min.detach().clone().float()
@@ -367,12 +418,10 @@ def materialize_sequence_split(
                 f"expected {(state_dim,)}, got {tuple(joint_raw_min.shape)}"
             )
 
-        sample_goal = torch.as_tensor(goals[0])
+        sample_goal = torch.as_tensor(goals[0]).float().reshape(-1)
         goal_dim = int(sample_goal.numel())
-        if goal_dim != 9:
-            raise ValueError(
-                f"Expected goals to flatten to size 9, got stored shape {tuple(goals.shape[1:])}"
-            )
+        if goal_dim <= 0:
+            raise ValueError(f"Expected goal_dim > 0, got stored shape {tuple(goals.shape[1:])}")
 
         for seg_idx in segment_indices:
             seg_len = int(lengths[seg_idx])
@@ -389,10 +438,11 @@ def materialize_sequence_split(
             traj = torch.from_numpy(trajectories[seg_idx, :seg_len]).float()
             traj = normalize_joint_tensor(traj, joint_raw_min=joint_raw_min, joint_raw_max=joint_raw_max)
 
-            goal = torch.from_numpy(goals[seg_idx]).float().reshape(3, 3)
-            if goal_norm is not None:
-                goal = goal_norm(goal.t().unsqueeze(-1)).squeeze(-1).t()
-            goal_row = goal.reshape(-1)
+            goal_row = torch.from_numpy(goals[seg_idx]).float().reshape(-1)
+            if goal_mean is not None or goal_std is not None:
+                if goal_mean is None or goal_std is None:
+                    raise ValueError("goal_mean and goal_std must either both be provided or both be omitted.")
+                goal_row = normalize_goal_components(goal_row, goal_mean=goal_mean, goal_std=goal_std)
 
             for t in range(sample_count):
                 start_idx = max(0, t - history_len + 1)
@@ -456,6 +506,7 @@ def build_segment_split(
     train_ratio: float,
     seed: int,
     action_horizon: int,
+    behavior_stream: str,
 ) -> Tuple[List[int], List[int], SplitSummary]:
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"train_ratio must be in (0, 1), got {train_ratio}")
@@ -463,16 +514,28 @@ def build_segment_split(
     with h5py.File(path, "r") as f:
         num_segments = int(f["goals"].shape[0])
         lengths = f["lengths"][:]
+        labels_ds = f.get("behavior_stream_labels")
+        if labels_ds is None:
+            raise RuntimeError(
+                "The dataset does not contain behavior_stream_labels. Rebuild the segment store "
+                "with the phased segment builder before training per-stream models."
+            )
+        labels = [_decode_behavior_stream_label(x) for x in labels_ds[:]]
 
-    rejected_segments = [idx for idx, seg_len in enumerate(lengths) if int(seg_len) <= action_horizon]
-    accepted_segments = [idx for idx, seg_len in enumerate(lengths) if int(seg_len) > action_horizon]
+    matching_segments = [idx for idx, label in enumerate(labels) if label == behavior_stream]
+    if not matching_segments:
+        raise RuntimeError(f"No segments found for behavior_stream={behavior_stream!r}.")
+
+    rejected_segments = [idx for idx in matching_segments if int(lengths[idx]) <= action_horizon]
+    accepted_segments = [idx for idx in matching_segments if int(lengths[idx]) > action_horizon]
 
     rng = random.Random(seed)
     rng.shuffle(accepted_segments)
 
     if len(accepted_segments) == 0:
         raise RuntimeError(
-            f"No usable segments found: every segment has length <= action_horizon ({action_horizon})."
+            f"No usable segments found for behavior_stream={behavior_stream!r}: "
+            f"every matching segment has length <= action_horizon ({action_horizon})."
         )
 
     train_count = int(math.floor(len(accepted_segments) * train_ratio))
@@ -486,7 +549,7 @@ def build_segment_split(
 
     if not val_segments:
         warnings.warn(
-            "Validation split is empty after the segment-level split. "
+            f"Validation split is empty for behavior_stream={behavior_stream!r}. "
             "Consider using more data or a different train_ratio.",
             stacklevel=2,
         )
@@ -495,7 +558,9 @@ def build_segment_split(
     val_samples = int(sum(max(0, int(lengths[idx]) - action_horizon) for idx in val_segments))
 
     summary = SplitSummary(
-        total_segments=num_segments,
+        behavior_stream=behavior_stream,
+        total_segments_in_file=num_segments,
+        matching_behavior_segments=len(matching_segments),
         accepted_segments=len(accepted_segments),
         rejected_segments=len(rejected_segments),
         train_segments=len(train_segments),
@@ -523,15 +588,15 @@ def compute_goal_normalization_stats(
             if seg_len <= action_horizon:
                 continue
 
-            goal = torch.from_numpy(goals[seg_idx]).float().reshape(3, 3)
+            goal = torch.from_numpy(goals[seg_idx]).float().reshape(-1)
             goal_rows.append(goal)
 
     if not goal_rows:
         raise RuntimeError("No usable train segments for goal normalization stats.")
 
     goal_all = torch.stack(goal_rows, dim=0)
-    goal_mean = goal_all.mean(dim=(0, 1))
-    goal_std = goal_all.std(dim=(0, 1), unbiased=False).clamp_min(eps)
+    goal_mean = goal_all.mean(dim=0)
+    goal_std = goal_all.std(dim=0, unbiased=False).clamp_min(eps)
 
     return {
         "goal_mean": goal_mean,
@@ -548,7 +613,7 @@ def teacher_forcing_ratio_for_epoch(epoch: int, total_epochs: int, start: float,
     return float(max(0.0, min(1.0, ratio)))
 
 
-def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit) -> nn.Module:
+def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit, behavior_stream: str) -> nn.Module:
     common = dict(
         state_dim=split.state_dim,
         goal_dim=split.goal_dim,
@@ -563,6 +628,7 @@ def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit) -> n
             hidden_dims=args.mlp_hidden_dims,
             dropout=args.mlp_dropout,
             loss_type=args.mlp_loss_type,
+            behavior_stream=behavior_stream,
         )
 
     if args.model == "lstm":
@@ -574,6 +640,7 @@ def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit) -> n
             dropout=args.lstm_dropout,
             default_teacher_forcing_ratio=args.teacher_forcing_start,
             loss_type=args.lstm_loss_type,
+            behavior_stream=behavior_stream,
         )
 
     if args.model == "act":
@@ -589,6 +656,7 @@ def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit) -> n
             kl_weight=args.act_kl_weight,
             recon_loss_type=args.act_recon_loss_type,
             sample_prior_at_inference=args.act_sample_prior_at_inference,
+            behavior_stream=behavior_stream,
         )
 
     raise ValueError(f"Unsupported model type: {args.model!r}")
@@ -730,21 +798,21 @@ def save_checkpoint(
     )
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    seed_everything(args.seed)
-    if not torch.cuda.is_available():
-        raise RuntimeError("This VRAM-first rewrite requires CUDA, but no CUDA device is available.")
-    device = torch.device("cuda")
+def train_for_behavior_stream(
+    args: argparse.Namespace,
+    root_output_dir: Path,
+    device: torch.device,
+    behavior_stream: str,
+) -> None:
+    stream_output_dir = root_output_dir / behavior_stream
+    stream_output_dir.mkdir(parents=True, exist_ok=True)
 
     train_segments, val_segments, split_summary = build_segment_split(
         path=args.data,
         train_ratio=args.train_ratio,
         seed=args.seed,
         action_horizon=args.action_horizon,
+        behavior_stream=behavior_stream,
     )
 
     goal_stats = compute_goal_normalization_stats(
@@ -752,40 +820,38 @@ def main() -> None:
         train_segments=train_segments,
         action_horizon=args.action_horizon,
     )
-    goal_norm = Normalize(
-        mean=goal_stats["goal_mean"].tolist(),
-        std=goal_stats["goal_std"].tolist(),
-    )
-
     train_split_cpu = materialize_sequence_split(
         path=args.data,
         segment_indices=train_segments,
-        split_name="train",
+        split_name=f"{behavior_stream}/train",
         history_len=args.history_len,
         action_horizon=args.action_horizon,
         joint_raw_min=JOINT_STATE_RAW_MIN,
         joint_raw_max=JOINT_STATE_RAW_MAX,
-        goal_norm=goal_norm,
+        goal_mean=goal_stats["goal_mean"],
+        goal_std=goal_stats["goal_std"],
     )
     val_split_cpu = materialize_sequence_split(
         path=args.data,
         segment_indices=val_segments,
-        split_name="val",
+        split_name=f"{behavior_stream}/val",
         history_len=args.history_len,
         action_horizon=args.action_horizon,
         joint_raw_min=JOINT_STATE_RAW_MIN,
         joint_raw_max=JOINT_STATE_RAW_MAX,
-        goal_norm=goal_norm,
+        goal_mean=goal_stats["goal_mean"],
+        goal_std=goal_stats["goal_std"],
     )
 
+    print(f"\n=== behavior_stream={behavior_stream} ===")
     print("Segment split summary:")
     print(json.dumps(asdict(split_summary), indent=2))
     print("Goal normalization stats (train split only):")
     print(
         json.dumps(
             {
-                "goal_mean_grouped": goal_stats["goal_mean"].tolist(),
-                "goal_std_grouped": goal_stats["goal_std"].tolist(),
+                "goal_mean": goal_stats["goal_mean"].tolist(),
+                "goal_std": goal_stats["goal_std"].tolist(),
             },
             indent=2,
         )
@@ -828,7 +894,7 @@ def main() -> None:
     del train_split_cpu
     del val_split_cpu
 
-    model = build_model(args, train_split).to(device)
+    model = build_model(args, train_split, behavior_stream=behavior_stream).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -837,7 +903,9 @@ def main() -> None:
 
     config: Dict[str, object] = {
         "data": str(args.data),
-        "output_dir": str(output_dir),
+        "output_dir": str(stream_output_dir),
+        "root_output_dir": str(root_output_dir),
+        "behavior_stream": behavior_stream,
         "model_choice": args.model,
         "train_ratio": args.train_ratio,
         "seed": args.seed,
@@ -862,10 +930,10 @@ def main() -> None:
             "joint_raw_min": JOINT_STATE_RAW_MIN.tolist(),
             "joint_raw_max": JOINT_STATE_RAW_MAX.tolist(),
             "goal_enabled": True,
-            "goal_library": "torchvision.transforms.Normalize",
-            "goal_mean_grouped": goal_stats["goal_mean"].tolist(),
-            "goal_std_grouped": goal_stats["goal_std"].tolist(),
-            "goal_mode": "grouped_by_coordinate_across_3_entries",
+            "goal_library": None,
+            "goal_mean": goal_stats["goal_mean"].tolist(),
+            "goal_std": goal_stats["goal_std"].tolist(),
+            "goal_mode": "independent_component_standardization",
             "target_uses_joint_scaling": True,
         },
         "sample_formation": {
@@ -940,7 +1008,7 @@ def main() -> None:
         history.append(epoch_record)
 
         message = (
-            f"epoch {epoch:03d} | train_loss={train_metrics['loss']:.6f} | "
+            f"[{behavior_stream}] epoch {epoch:03d} | train_loss={train_metrics['loss']:.6f} | "
             f"val_loss={val_metrics['loss']:.6f}"
         )
         if args.model == "lstm" and current_teacher_forcing is not None:
@@ -954,20 +1022,44 @@ def main() -> None:
             )
         print(message)
 
-        save_checkpoint(output_dir / "latest.pt", model, optimizer, epoch, history, config)
+        save_checkpoint(stream_output_dir / "latest.pt", model, optimizer, epoch, history, config)
 
         if not math.isnan(val_metrics["loss"]) and val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            save_checkpoint(output_dir / "best.pt", model, optimizer, epoch, history, config)
+            save_checkpoint(stream_output_dir / "best.pt", model, optimizer, epoch, history, config)
 
-    with open(output_dir / "history.json", "w", encoding="utf-8") as f:
+    with open(stream_output_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
+    with open(stream_output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    print(f"Finished. Wrote outputs to: {output_dir}")
+    print(f"Finished behavior_stream={behavior_stream}. Wrote outputs to: {stream_output_dir}")
     print("Saved: latest.pt, best.pt, history.json, summary.json")
+
+
+def main() -> None:
+    args = parse_args()
+    root_output_dir = Path(args.output_dir)
+    root_output_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_everything(args.seed)
+    if not torch.cuda.is_available():
+        raise RuntimeError("This VRAM-first rewrite requires CUDA, but no CUDA device is available.")
+    device = torch.device("cuda")
+
+    requested_streams = resolve_behavior_streams(args.behavior_stream)
+    print(f"Training behavior streams: {requested_streams}")
+
+    for behavior_stream in requested_streams:
+        train_for_behavior_stream(
+            args=args,
+            root_output_dir=root_output_dir,
+            device=device,
+            behavior_stream=behavior_stream,
+        )
+
+    print(f"Finished all requested behavior streams. Root output dir: {root_output_dir}")
 
 
 if __name__ == "__main__":

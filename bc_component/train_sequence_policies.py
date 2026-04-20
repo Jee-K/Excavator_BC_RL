@@ -1,12 +1,20 @@
 """
 Sequence goal-conditioned behavioral cloning trainer.
 
+Rewritten for a VRAM-first training flow:
+- split train/val at the segment level
+- materialize every supervised sample for each split up front
+- normalize once during materialization
+- move the full train/val tensors onto the GPU before training begins
+- batch by indexing already-resident GPU tensors
+- show tqdm bar-style progress for train/val each epoch
+
 This trainer supports the three sequence policies defined in models.py:
     - GoalConditionedMLPPolicy
     - LSTMSeq2SeqPolicy
     - ACTStylePolicy
 
-Assumptions carried over from the single-step trainer:
+Assumptions carried over from the original sequence trainer:
 - Input data lives in an HDF5 segment store with datasets:
     goals:        (S, 9) or (S, 3, 3)
     trajectories: (S, N_max, 4)
@@ -18,7 +26,7 @@ Assumptions carried over from the single-step trainer:
   computed on the train split only.
 - CUDA is assumed to be available.
 
-Supervised sample formation chosen here:
+Supervised sample formation:
 - One sample is anchored at time index t.
 - Input history is the fixed-length window ending at t:
       state_history = trajectory[max(0, t-history_len+1) : t+1]
@@ -27,19 +35,7 @@ Supervised sample formation chosen here:
 - Target chunk is the next action_horizon steps:
       action_targets = trajectory[t+1 : t+1+action_horizon]
 - Only anchors with a full future chunk are kept.
-- start_action is set to trajectory[t], which is a reasonable decoder warm-start in
-  this setting because trajectories provide both the observed state stream and the
-  supervised future targets in the same joint space.
-
-Notes:
-- ACT consumes history_mask directly.
-- The provided MLP/LSTM model definitions do not consume history_mask. They therefore
-  see zero-padded prefix tokens. If that becomes a limitation, the model definitions
-  should be updated rather than adding hidden trainer-side branching.
-- For the LSTM, teacher forcing is scheduled linearly from --teacher-forcing-start to
-  --teacher-forcing-end across training. This is a pragmatic compromise: strong guidance
-  early for optimization stability, then reduced dependence on teacher forcing later.
-  See teacher_forcing_ratio_for_epoch(...) if you want to change the schedule.
+- start_action is set to trajectory[t], which is the decoder warm-start.
 """
 
 import argparse
@@ -49,14 +45,14 @@ import random
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import h5py
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Normalize
+from tqdm.auto import tqdm
 
 from models import ACTStylePolicy, GoalConditionedMLPPolicy, LSTMSeq2SeqPolicy
 
@@ -75,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./bc_component/outputs/sequence_policy",
+        required=True,
         help="Directory for checkpoints and logs.",
     )
     parser.add_argument(
@@ -89,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=512, help="Batch size.")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size for GPU-side batching.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay.")
     parser.add_argument(
@@ -98,7 +94,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Gradient clipping max norm. Set <= 0 to disable.",
     )
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Ignored in this rewrite because the dataset is preloaded and batched directly on device.",
+    )
 
     parser.add_argument("--history-len", type=int, default=16, help="Length of the fixed history window.")
     parser.add_argument("--action-horizon", type=int, default=8, help="Number of future targets to predict.")
@@ -197,184 +198,108 @@ class SplitSummary:
     val_samples: int
 
 
-class SequenceSegmentDataset(Dataset):
-    """
-    In-memory segment dataset for sequence-conditioned supervised learning.
-
-    Each supervised sample contains:
-        state_history:   [history_len, state_dim]
-        history_mask:    [history_len] bool, True where valid
-        goal:            [goal_dim]
-        action_targets:  [action_horizon, action_dim]
-        start_action:    [action_dim]
-
-    A sample is anchored at time index t, where the model sees the padded history ending
-    at t and predicts the next action_horizon joint targets.
-    """
-
-    def __init__(
-        self,
-        path: str | Path,
-        segment_indices: Iterable[int],
-        split_name: str,
-        history_len: int,
-        action_horizon: int,
-        joint_raw_min: Tensor,
-        joint_raw_max: Tensor,
-        goal_norm: Optional[Normalize] = None,
-    ) -> None:
-        self.path = str(path)
-        self.segment_indices = list(segment_indices)
-        self.split_name = split_name
-        self.history_len = int(history_len)
-        self.action_horizon = int(action_horizon)
-        self.joint_raw_min = joint_raw_min.detach().clone().float()
-        self.joint_raw_max = joint_raw_max.detach().clone().float()
-        self.goal_norm = goal_norm
-        self.rejected_segments: List[Tuple[int, int]] = []
-
-        if self.history_len <= 0:
-            raise ValueError(f"history_len must be positive, got {self.history_len}")
-        if self.action_horizon <= 0:
-            raise ValueError(f"action_horizon must be positive, got {self.action_horizon}")
-        if self.joint_raw_min.ndim != 1 or self.joint_raw_max.ndim != 1:
-            raise ValueError("joint_raw_min and joint_raw_max must be rank-1 tensors")
-        if self.joint_raw_min.shape != self.joint_raw_max.shape:
-            raise ValueError("joint_raw_min and joint_raw_max must have the same shape")
-        if not torch.all(self.joint_raw_max > self.joint_raw_min):
-            raise ValueError("Every entry in joint_raw_max must be strictly greater than joint_raw_min.")
-
-        history_rows: List[Tensor] = []
-        history_mask_rows: List[Tensor] = []
-        target_rows: List[Tensor] = []
-        goal_rows: List[Tensor] = []
-        start_action_rows: List[Tensor] = []
-        segment_id_rows: List[Tensor] = []
-        timestep_rows: List[Tensor] = []
-
-        with h5py.File(self.path, "r") as f:
-            goals = f["goals"]
-            trajectories = f["trajectories"]
-            lengths = f["lengths"]
-
-            if trajectories.ndim != 3:
-                raise ValueError(
-                    f"Expected trajectories with shape (S, N, state_dim), got {tuple(trajectories.shape)}"
-                )
-
-            self.state_dim = int(trajectories.shape[2])
-            self.action_dim = self.state_dim
-            if self.joint_raw_min.shape != (self.state_dim,) or self.joint_raw_max.shape != (self.state_dim,):
-                raise ValueError(
-                    "Normalization constants must match trajectory feature dimension: "
-                    f"expected {(self.state_dim,)}, got {tuple(self.joint_raw_min.shape)}"
-                )
-
-            sample_goal = torch.as_tensor(goals[0])
-            self.goal_dim = int(sample_goal.numel())
-            if self.goal_dim != 9:
-                raise ValueError(
-                    f"Expected goals to flatten to size 9, got stored shape {tuple(goals.shape[1:])}"
-                )
-
-            for seg_idx in self.segment_indices:
-                seg_len = int(lengths[seg_idx])
-                sample_count = max(0, seg_len - self.action_horizon)
-                if sample_count <= 0:
-                    self.rejected_segments.append((seg_idx, seg_len))
-                    warnings.warn(
-                        f"[{self.split_name}] rejecting segment {seg_idx} with length {seg_len}: "
-                        f"need at least {self.action_horizon + 1} steps for a full future target chunk.",
-                        stacklevel=2,
-                    )
-                    continue
-
-                traj = torch.from_numpy(trajectories[seg_idx, :seg_len]).float()
-                traj = self._normalize_joint_tensor(traj)
-                goal = torch.from_numpy(goals[seg_idx]).float()
-                goal_row = self._normalize_goal(goal)
-
-                for t in range(sample_count):
-                    history, history_mask = self._build_history_window(traj, t)
-                    action_targets = traj[t + 1 : t + 1 + self.action_horizon]
-                    start_action = traj[t]
-
-                    history_rows.append(history.unsqueeze(0))
-                    history_mask_rows.append(history_mask.unsqueeze(0))
-                    target_rows.append(action_targets.unsqueeze(0))
-                    goal_rows.append(goal_row.unsqueeze(0))
-                    start_action_rows.append(start_action.unsqueeze(0))
-                    segment_id_rows.append(torch.tensor([seg_idx], dtype=torch.long))
-                    timestep_rows.append(torch.tensor([t], dtype=torch.long))
-
-        if history_rows:
-            self.state_histories = torch.cat(history_rows, dim=0).contiguous()
-            self.history_masks = torch.cat(history_mask_rows, dim=0).contiguous()
-            self.action_targets = torch.cat(target_rows, dim=0).contiguous()
-            self.goals = torch.cat(goal_rows, dim=0).contiguous()
-            self.start_actions = torch.cat(start_action_rows, dim=0).contiguous()
-            self.segment_ids = torch.cat(segment_id_rows, dim=0).contiguous()
-            self.timesteps = torch.cat(timestep_rows, dim=0).contiguous()
-        else:
-            self.state_histories = torch.empty((0, self.history_len, self.state_dim), dtype=torch.float32)
-            self.history_masks = torch.empty((0, self.history_len), dtype=torch.bool)
-            self.action_targets = torch.empty((0, self.action_horizon, self.action_dim), dtype=torch.float32)
-            self.goals = torch.empty((0, self.goal_dim), dtype=torch.float32)
-            self.start_actions = torch.empty((0, self.action_dim), dtype=torch.float32)
-            self.segment_ids = torch.empty((0,), dtype=torch.long)
-            self.timesteps = torch.empty((0,), dtype=torch.long)
-
-        total_bytes = (
-            self.state_histories.numel() * self.state_histories.element_size()
-            + self.history_masks.numel() * self.history_masks.element_size()
-            + self.action_targets.numel() * self.action_targets.element_size()
-            + self.goals.numel() * self.goals.element_size()
-            + self.start_actions.numel() * self.start_actions.element_size()
-            + self.segment_ids.numel() * self.segment_ids.element_size()
-            + self.timesteps.numel() * self.timesteps.element_size()
-        )
-        print(
-            f"[{self.split_name}] loaded {len(self.state_histories)} samples into RAM "
-            f"({total_bytes / 1024**3:.3f} GiB)"
-        )
+@dataclass
+class MaterializedSequenceSplit:
+    split_name: str
+    state_histories: Tensor
+    history_masks: Tensor
+    goals: Tensor
+    action_targets: Tensor
+    start_actions: Tensor
+    segment_ids: Tensor
+    timesteps: Tensor
+    rejected_segments: List[Tuple[int, int]]
+    state_dim: int
+    goal_dim: int
+    action_dim: int
+    history_len: int
+    action_horizon: int
 
     def __len__(self) -> int:
         return int(self.state_histories.shape[0])
 
-    def _normalize_joint_tensor(self, x: Tensor) -> Tensor:
-        x = x.float()
-        return 2.0 * (x - self.joint_raw_min) / (self.joint_raw_max - self.joint_raw_min) - 1.0
+    @property
+    def bytes(self) -> int:
+        return (
+            self.state_histories.numel() * self.state_histories.element_size()
+            + self.history_masks.numel() * self.history_masks.element_size()
+            + self.goals.numel() * self.goals.element_size()
+            + self.action_targets.numel() * self.action_targets.element_size()
+            + self.start_actions.numel() * self.start_actions.element_size()
+            + self.segment_ids.numel() * self.segment_ids.element_size()
+            + self.timesteps.numel() * self.timesteps.element_size()
+        )
 
-    def _normalize_goal(self, goal: Tensor) -> Tensor:
-        goal = goal.reshape(3, 3)
-        if self.goal_norm is None:
-            return goal.reshape(-1)
 
-        g = goal.t().unsqueeze(-1)
-        g = self.goal_norm(g)
-        return g.squeeze(-1).t().reshape(-1)
+class DeviceSequenceSplit:
+    """A full split that already lives on the target device."""
 
-    def _build_history_window(self, traj: Tensor, t: int) -> Tuple[Tensor, Tensor]:
-        start_idx = max(0, t - self.history_len + 1)
-        history_valid = traj[start_idx : t + 1]
-        valid_len = int(history_valid.shape[0])
+    def __init__(self, split: MaterializedSequenceSplit, device: torch.device) -> None:
+        self.split_name = split.split_name
+        self.state_histories = split.state_histories.to(device=device, non_blocking=False)
+        self.history_masks = split.history_masks.to(device=device, non_blocking=False)
+        self.goals = split.goals.to(device=device, non_blocking=False)
+        self.action_targets = split.action_targets.to(device=device, non_blocking=False)
+        self.start_actions = split.start_actions.to(device=device, non_blocking=False)
+        self.segment_ids = split.segment_ids.to(device=device, non_blocking=False)
+        self.timesteps = split.timesteps.to(device=device, non_blocking=False)
+        self.rejected_segments = split.rejected_segments
+        self.state_dim = split.state_dim
+        self.goal_dim = split.goal_dim
+        self.action_dim = split.action_dim
+        self.history_len = split.history_len
+        self.action_horizon = split.action_horizon
+        self.device = device
 
-        history = torch.zeros((self.history_len, self.state_dim), dtype=torch.float32)
-        history_mask = torch.zeros((self.history_len,), dtype=torch.bool)
-        history[-valid_len:] = history_valid
-        history_mask[-valid_len:] = True
-        return history, history_mask
+    def __len__(self) -> int:
+        return int(self.state_histories.shape[0])
 
-    def __getitem__(self, idx: int) -> Dict[str, Tensor]:
-        return {
-            "state_history": self.state_histories[idx],
-            "history_mask": self.history_masks[idx],
-            "goal": self.goals[idx],
-            "action_targets": self.action_targets[idx],
-            "start_action": self.start_actions[idx],
-            "segment_idx": self.segment_ids[idx],
-            "t": self.timesteps[idx],
-        }
+    @property
+    def bytes(self) -> int:
+        return (
+            self.state_histories.numel() * self.state_histories.element_size()
+            + self.history_masks.numel() * self.history_masks.element_size()
+            + self.goals.numel() * self.goals.element_size()
+            + self.action_targets.numel() * self.action_targets.element_size()
+            + self.start_actions.numel() * self.start_actions.element_size()
+            + self.segment_ids.numel() * self.segment_ids.element_size()
+            + self.timesteps.numel() * self.timesteps.element_size()
+        )
+
+    def iter_batches(
+        self,
+        batch_size: int,
+        shuffle: bool,
+        teacher_forcing_ratio: Optional[float] = None,
+    ) -> Iterator[Dict[str, Tensor | float]]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if len(self) == 0:
+            return
+
+        if shuffle:
+            indices = torch.randperm(len(self), device=self.device)
+        else:
+            indices = torch.arange(len(self), device=self.device)
+
+        for start in range(0, len(self), batch_size):
+            batch_idx = indices[start : start + batch_size]
+            batch: Dict[str, Tensor | float] = {
+                "state_history": self.state_histories.index_select(0, batch_idx),
+                "history_mask": self.history_masks.index_select(0, batch_idx),
+                "goal": self.goals.index_select(0, batch_idx),
+                "action_targets": self.action_targets.index_select(0, batch_idx),
+                "start_action": self.start_actions.index_select(0, batch_idx),
+                "segment_idx": self.segment_ids.index_select(0, batch_idx),
+                "t": self.timesteps.index_select(0, batch_idx),
+            }
+            if teacher_forcing_ratio is not None:
+                batch["teacher_forcing_ratio"] = float(teacher_forcing_ratio)
+            yield batch
+
+
+def format_bytes(num_bytes: int) -> str:
+    return f"{num_bytes / 1024**3:.3f} GiB"
 
 
 def seed_everything(seed: int) -> None:
@@ -383,6 +308,147 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def normalize_joint_tensor(x: Tensor, joint_raw_min: Tensor, joint_raw_max: Tensor) -> Tensor:
+    x = x.float()
+    return 2.0 * (x - joint_raw_min) / (joint_raw_max - joint_raw_min) - 1.0
+
+
+def materialize_sequence_split(
+    path: str | Path,
+    segment_indices: Iterable[int],
+    split_name: str,
+    history_len: int,
+    action_horizon: int,
+    joint_raw_min: Tensor,
+    joint_raw_max: Tensor,
+    goal_norm: Optional[Normalize] = None,
+) -> MaterializedSequenceSplit:
+    segment_indices = list(segment_indices)
+    joint_raw_min = joint_raw_min.detach().clone().float()
+    joint_raw_max = joint_raw_max.detach().clone().float()
+    rejected_segments: List[Tuple[int, int]] = []
+
+    if history_len <= 0:
+        raise ValueError(f"history_len must be positive, got {history_len}")
+    if action_horizon <= 0:
+        raise ValueError(f"action_horizon must be positive, got {action_horizon}")
+    if joint_raw_min.ndim != 1 or joint_raw_max.ndim != 1:
+        raise ValueError("joint_raw_min and joint_raw_max must be rank-1 tensors")
+    if joint_raw_min.shape != joint_raw_max.shape:
+        raise ValueError("joint_raw_min and joint_raw_max must have the same shape")
+    if not torch.all(joint_raw_max > joint_raw_min):
+        raise ValueError("Every entry in joint_raw_max must be strictly greater than joint_raw_min.")
+
+    history_rows: List[Tensor] = []
+    history_mask_rows: List[Tensor] = []
+    target_rows: List[Tensor] = []
+    goal_rows: List[Tensor] = []
+    start_action_rows: List[Tensor] = []
+    segment_id_rows: List[Tensor] = []
+    timestep_rows: List[Tensor] = []
+
+    with h5py.File(path, "r") as f:
+        goals = f["goals"]
+        trajectories = f["trajectories"]
+        lengths = f["lengths"]
+
+        if trajectories.ndim != 3:
+            raise ValueError(
+                f"Expected trajectories with shape (S, N, state_dim), got {tuple(trajectories.shape)}"
+            )
+
+        state_dim = int(trajectories.shape[2])
+        action_dim = state_dim
+        if joint_raw_min.shape != (state_dim,) or joint_raw_max.shape != (state_dim,):
+            raise ValueError(
+                "Normalization constants must match trajectory feature dimension: "
+                f"expected {(state_dim,)}, got {tuple(joint_raw_min.shape)}"
+            )
+
+        sample_goal = torch.as_tensor(goals[0])
+        goal_dim = int(sample_goal.numel())
+        if goal_dim != 9:
+            raise ValueError(
+                f"Expected goals to flatten to size 9, got stored shape {tuple(goals.shape[1:])}"
+            )
+
+        for seg_idx in segment_indices:
+            seg_len = int(lengths[seg_idx])
+            sample_count = max(0, seg_len - action_horizon)
+            if sample_count <= 0:
+                rejected_segments.append((seg_idx, seg_len))
+                warnings.warn(
+                    f"[{split_name}] rejecting segment {seg_idx} with length {seg_len}: "
+                    f"need at least {action_horizon + 1} steps for a full future target chunk.",
+                    stacklevel=2,
+                )
+                continue
+
+            traj = torch.from_numpy(trajectories[seg_idx, :seg_len]).float()
+            traj = normalize_joint_tensor(traj, joint_raw_min=joint_raw_min, joint_raw_max=joint_raw_max)
+
+            goal = torch.from_numpy(goals[seg_idx]).float().reshape(3, 3)
+            if goal_norm is not None:
+                goal = goal_norm(goal.t().unsqueeze(-1)).squeeze(-1).t()
+            goal_row = goal.reshape(-1)
+
+            for t in range(sample_count):
+                start_idx = max(0, t - history_len + 1)
+                history_valid = traj[start_idx : t + 1]
+                valid_len = int(history_valid.shape[0])
+
+                history = torch.zeros((history_len, state_dim), dtype=torch.float32)
+                history_mask = torch.zeros((history_len,), dtype=torch.bool)
+                history[-valid_len:] = history_valid
+                history_mask[-valid_len:] = True
+
+                action_targets = traj[t + 1 : t + 1 + action_horizon]
+                start_action = traj[t]
+
+                history_rows.append(history.unsqueeze(0))
+                history_mask_rows.append(history_mask.unsqueeze(0))
+                target_rows.append(action_targets.unsqueeze(0))
+                goal_rows.append(goal_row.unsqueeze(0))
+                start_action_rows.append(start_action.unsqueeze(0))
+                segment_id_rows.append(torch.tensor([seg_idx], dtype=torch.long))
+                timestep_rows.append(torch.tensor([t], dtype=torch.long))
+
+    if history_rows:
+        state_histories = torch.cat(history_rows, dim=0).contiguous()
+        history_masks = torch.cat(history_mask_rows, dim=0).contiguous()
+        action_targets = torch.cat(target_rows, dim=0).contiguous()
+        goals_tensor = torch.cat(goal_rows, dim=0).contiguous()
+        start_actions = torch.cat(start_action_rows, dim=0).contiguous()
+        segment_ids = torch.cat(segment_id_rows, dim=0).contiguous()
+        timesteps = torch.cat(timestep_rows, dim=0).contiguous()
+    else:
+        state_histories = torch.empty((0, history_len, state_dim), dtype=torch.float32)
+        history_masks = torch.empty((0, history_len), dtype=torch.bool)
+        action_targets = torch.empty((0, action_horizon, action_dim), dtype=torch.float32)
+        goals_tensor = torch.empty((0, goal_dim), dtype=torch.float32)
+        start_actions = torch.empty((0, action_dim), dtype=torch.float32)
+        segment_ids = torch.empty((0,), dtype=torch.long)
+        timesteps = torch.empty((0,), dtype=torch.long)
+
+    split = MaterializedSequenceSplit(
+        split_name=split_name,
+        state_histories=state_histories,
+        history_masks=history_masks,
+        goals=goals_tensor,
+        action_targets=action_targets,
+        start_actions=start_actions,
+        segment_ids=segment_ids,
+        timesteps=timesteps,
+        rejected_segments=rejected_segments,
+        state_dim=state_dim,
+        goal_dim=goal_dim,
+        action_dim=action_dim,
+        history_len=history_len,
+        action_horizon=action_horizon,
+    )
+    return split
 
 
 def build_segment_split(
@@ -474,11 +540,7 @@ def compute_goal_normalization_stats(
 
 
 def teacher_forcing_ratio_for_epoch(epoch: int, total_epochs: int, start: float, end: float) -> float:
-    """
-    Linear teacher forcing schedule for the LSTM decoder.
-
-    Change this function if you want a different schedule later.
-    """
+    """Linear teacher forcing schedule for the LSTM decoder."""
     if total_epochs <= 1:
         return float(end)
     progress = float(epoch - 1) / float(total_epochs - 1)
@@ -486,28 +548,11 @@ def teacher_forcing_ratio_for_epoch(epoch: int, total_epochs: int, start: float,
     return float(max(0.0, min(1.0, ratio)))
 
 
-def move_batch_to_device(
-    batch: Dict[str, Tensor],
-    device: torch.device,
-    teacher_forcing_ratio: Optional[float] = None,
-) -> Dict[str, Tensor]:
-    out: Dict[str, Tensor | float] = {
-        "state_history": batch["state_history"].to(device, non_blocking=True),
-        "history_mask": batch["history_mask"].to(device, non_blocking=True),
-        "goal": batch["goal"].to(device, non_blocking=True),
-        "action_targets": batch["action_targets"].to(device, non_blocking=True),
-        "start_action": batch["start_action"].to(device, non_blocking=True),
-    }
-    if teacher_forcing_ratio is not None:
-        out["teacher_forcing_ratio"] = float(teacher_forcing_ratio)
-    return out  # type: ignore[return-value]
-
-
-def build_model(args: argparse.Namespace, dataset: SequenceSegmentDataset) -> nn.Module:
+def build_model(args: argparse.Namespace, split: MaterializedSequenceSplit) -> nn.Module:
     common = dict(
-        state_dim=dataset.state_dim,
-        goal_dim=dataset.goal_dim,
-        action_dim=dataset.action_dim,
+        state_dim=split.state_dim,
+        goal_dim=split.goal_dim,
+        action_dim=split.action_dim,
         history_len=args.history_len,
         action_horizon=args.action_horizon,
     )
@@ -565,23 +610,35 @@ def scalar_metrics_from_output(out: Dict[str, Tensor], model_name: str) -> Dict[
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
+    split: DeviceSequenceSplit,
+    batch_size: int,
     model_name: str,
+    epoch: int,
+    total_epochs: int,
 ) -> Dict[str, float]:
     model.eval()
     totals: Dict[str, float] = {}
     total_count = 0
+    num_batches = math.ceil(len(split) / batch_size) if len(split) > 0 else 0
 
-    for batch in loader:
-        batch = move_batch_to_device(batch, device=device, teacher_forcing_ratio=None)
+    progress = tqdm(
+        split.iter_batches(batch_size=batch_size, shuffle=False, teacher_forcing_ratio=None),
+        total=num_batches,
+        desc=f"Epoch {epoch:03d}/{total_epochs:03d} [val]",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for batch in progress:
         out = model(batch)
         metrics = scalar_metrics_from_output(out, model_name=model_name)
-        batch_size = int(batch["action_targets"].shape[0])
+        batch_size_actual = int(batch["action_targets"].shape[0])
 
         for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + value * batch_size
-        total_count += batch_size
+            totals[key] = totals.get(key, 0.0) + value * batch_size_actual
+        total_count += batch_size_actual
+
+        if "loss" in metrics:
+            progress.set_postfix(loss=f"{metrics['loss']:.4f}")
 
     if total_count == 0:
         result = {"loss": float("nan")}
@@ -595,19 +652,32 @@ def evaluate(
 
 def train_one_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    split: DeviceSequenceSplit,
     optimizer: torch.optim.Optimizer,
-    device: torch.device,
     model_name: str,
     teacher_forcing_ratio: Optional[float],
     clip_grad_norm: Optional[float],
+    batch_size: int,
+    epoch: int,
+    total_epochs: int,
 ) -> Dict[str, float]:
     model.train()
     totals: Dict[str, float] = {}
     total_count = 0
+    num_batches = math.ceil(len(split) / batch_size) if len(split) > 0 else 0
 
-    for batch in loader:
-        batch = move_batch_to_device(batch, device=device, teacher_forcing_ratio=teacher_forcing_ratio)
+    progress = tqdm(
+        split.iter_batches(
+            batch_size=batch_size,
+            shuffle=True,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        ),
+        total=num_batches,
+        desc=f"Epoch {epoch:03d}/{total_epochs:03d} [train]",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for batch in progress:
         optimizer.zero_grad(set_to_none=True)
         out = model(batch)
         loss = out.get("loss")
@@ -621,13 +691,21 @@ def train_one_epoch(
         optimizer.step()
 
         metrics = scalar_metrics_from_output(out, model_name=model_name)
-        batch_size = int(batch["action_targets"].shape[0])
+        batch_size_actual = int(batch["action_targets"].shape[0])
         for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + value * batch_size
-        total_count += batch_size
+            totals[key] = totals.get(key, 0.0) + value * batch_size_actual
+        total_count += batch_size_actual
+
+        postfix = {}
+        if "loss" in metrics:
+            postfix["loss"] = f"{metrics['loss']:.4f}"
+        if teacher_forcing_ratio is not None:
+            postfix["tf"] = f"{teacher_forcing_ratio:.3f}"
+        if postfix:
+            progress.set_postfix(**postfix)
 
     if total_count == 0:
-        raise RuntimeError("Training loader produced zero samples.")
+        raise RuntimeError("Training split produced zero samples.")
 
     return {key: value / total_count for key, value in totals.items()}
 
@@ -658,6 +736,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_everything(args.seed)
+    if not torch.cuda.is_available():
+        raise RuntimeError("This VRAM-first rewrite requires CUDA, but no CUDA device is available.")
     device = torch.device("cuda")
 
     train_segments, val_segments, split_summary = build_segment_split(
@@ -677,7 +757,7 @@ def main() -> None:
         std=goal_stats["goal_std"].tolist(),
     )
 
-    train_dataset = SequenceSegmentDataset(
+    train_split_cpu = materialize_sequence_split(
         path=args.data,
         segment_indices=train_segments,
         split_name="train",
@@ -687,7 +767,7 @@ def main() -> None:
         joint_raw_max=JOINT_STATE_RAW_MAX,
         goal_norm=goal_norm,
     )
-    val_dataset = SequenceSegmentDataset(
+    val_split_cpu = materialize_sequence_split(
         path=args.data,
         segment_indices=val_segments,
         split_name="val",
@@ -721,33 +801,34 @@ def main() -> None:
         )
     )
     print(
-        f"Constructed datasets: train_samples={len(train_dataset)}, val_samples={len(val_dataset)}, "
-        f"train_rejected={len(train_dataset.rejected_segments)}, val_rejected={len(val_dataset.rejected_segments)}"
+        f"Constructed CPU splits: train_samples={len(train_split_cpu)}, val_samples={len(val_split_cpu)}, "
+        f"train_rejected={len(train_split_cpu.rejected_segments)}, val_rejected={len(val_split_cpu.rejected_segments)}"
     )
 
     if args.num_workers != 0:
         print(
-            f"Ignoring --num-workers={args.num_workers} because the full dataset is preloaded into RAM."
+            f"Ignoring --num-workers={args.num_workers} because the full dataset is preloaded and batched directly on device."
         )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-    )
+    print(f"Using device: {device}")
+    print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+    if hasattr(torch.cuda, "mem_get_info"):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
+        print(
+            f"CUDA memory before dataset upload: free={format_bytes(free_bytes)} / total={format_bytes(total_bytes)}"
+        )
 
-    model = build_model(args, train_dataset).to(device)
+    train_split = DeviceSequenceSplit(train_split_cpu, device=device)
+    val_split = DeviceSequenceSplit(val_split_cpu, device=device)
+
+    print(f"[train] moved full split to VRAM ({format_bytes(train_split.bytes)})")
+    print(f"[val] moved full split to VRAM ({format_bytes(val_split.bytes)})")
+    print(f"[total] dataset tensors resident in VRAM: {format_bytes(train_split.bytes + val_split.bytes)}")
+
+    del train_split_cpu
+    del val_split_cpu
+
+    model = build_model(args, train_split).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -768,6 +849,7 @@ def main() -> None:
         "device": str(device),
         "history_len": args.history_len,
         "action_horizon": args.action_horizon,
+        "dataset_residency": "full_train_and_val_splits_in_vram",
         "model": getattr(model, "config", {}),
         "teacher_forcing": {
             "enabled_for_model": args.model == "lstm",
@@ -780,7 +862,7 @@ def main() -> None:
             "joint_raw_min": JOINT_STATE_RAW_MIN.tolist(),
             "joint_raw_max": JOINT_STATE_RAW_MAX.tolist(),
             "goal_enabled": True,
-            "goal_library": "manual_grouped_normalization",
+            "goal_library": "torchvision.transforms.Normalize",
             "goal_mean_grouped": goal_stats["goal_mean"].tolist(),
             "goal_std_grouped": goal_stats["goal_std"].tolist(),
             "goal_mode": "grouped_by_coordinate_across_3_entries",
@@ -795,6 +877,11 @@ def main() -> None:
             "start_action": "trajectory[t]",
         },
         "split_summary": asdict(split_summary),
+        "dataset_bytes": {
+            "train_vram_bytes": train_split.bytes,
+            "val_vram_bytes": val_split.bytes,
+            "total_vram_bytes": train_split.bytes + val_split.bytes,
+        },
         "cli_args": vars(args),
     }
 
@@ -802,8 +889,6 @@ def main() -> None:
     best_val_loss = float("inf")
     clip_grad_norm = None if args.clip_grad_norm <= 0 else float(args.clip_grad_norm)
 
-    print(f"Using device: {device}")
-    print(f"CUDA device: {torch.cuda.get_device_name(device)}")
     print(f"Model config: {json.dumps(getattr(model, 'config', {}), indent=2)}")
 
     for epoch in range(1, args.epochs + 1):
@@ -818,16 +903,25 @@ def main() -> None:
 
         train_metrics = train_one_epoch(
             model=model,
-            loader=train_loader,
+            split=train_split,
             optimizer=optimizer,
-            device=device,
             model_name=args.model,
             teacher_forcing_ratio=current_teacher_forcing,
             clip_grad_norm=clip_grad_norm,
+            batch_size=args.batch_size,
+            epoch=epoch,
+            total_epochs=args.epochs,
         )
         val_metrics = (
-            evaluate(model=model, loader=val_loader, device=device, model_name=args.model)
-            if len(val_dataset) > 0
+            evaluate(
+                model=model,
+                split=val_split,
+                batch_size=args.batch_size,
+                model_name=args.model,
+                epoch=epoch,
+                total_epochs=args.epochs,
+            )
+            if len(val_split) > 0
             else {"loss": float("nan")}
         )
 

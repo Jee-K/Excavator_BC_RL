@@ -12,6 +12,22 @@ ROTATION_STEP = 0.1
 EXCEL_ROW_LIMIT = 1_048_576
 EXCEL_SAFETY_MARGIN = 5_000
 
+BEHAVIOR_STREAM_DIG_SWING = "dig_swing"
+BEHAVIOR_STREAM_DUMP_RETURN = "dump_return"
+BEHAVIOR_STREAMS = (BEHAVIOR_STREAM_DIG_SWING, BEHAVIOR_STREAM_DUMP_RETURN)
+GOAL_SOURCE_INDEX_BY_BEHAVIOR = {
+    BEHAVIOR_STREAM_DIG_SWING: 1,  # keep only the second 1/3 (dump waypoint)
+    BEHAVIOR_STREAM_DUMP_RETURN: 2,  # keep only the third 1/3 (reset waypoint)
+}
+GOAL_KEEP_COORD_INDICES = (0, 2)  # drop the middle / 2nd column entirely
+
+
+def reduce_goal_for_behavior(full_cycle_goal: np.ndarray, behavior_stream: str) -> np.ndarray:
+    full_cycle_goal = np.asarray(full_cycle_goal, dtype=np.float32)
+    goal_source_index = GOAL_SOURCE_INDEX_BY_BEHAVIOR[behavior_stream]
+    selected = full_cycle_goal[goal_source_index]
+    return np.asarray(selected[list(GOAL_KEEP_COORD_INDICES)], dtype=np.float32)
+
 
 def find_candidates(
     trajectories: np.ndarray,
@@ -100,41 +116,53 @@ def build_segments_detailed(
     mirror_original_indexing: bool = True,
 ) -> list[dict]:
     """
-    Build detailed segment records.
+    Build two detailed segment records for every dig->dump->return cycle:
+      - dig_swing   : cycle start through the dump timestep
+      - dump_return : dump timestep through the return / next dig timestep
+
+    Each produced segment stores a reduced 2-D goal vector. For dig_swing this is the
+    second 1/3 of the cycle goal, and for dump_return it is the third 1/3. In both
+    cases the middle coordinate is removed, so the stored goal is [col0, col2].
 
     When mirror_original_indexing=True (default), the goal extraction and trajectory slicing
     use the same indexes as the original script, so this builder stays aligned with the
     current HDF5 semantics.
 
-    keypoints_cylindrical[...][KEYPOINT_GOAL_INDEX] is interpreted as [r, h, theta],
-    so rotational augmentation should modify the theta component at index 2.
+    keypoints_cylindrical[...][KEYPOINT_GOAL_INDEX] is interpreted as [r, h, theta].
+    After reduction, the stored goal is [r, theta], so rotational augmentation modifies
+    the second entry of the reduced goal.
     """
     candidates = find_candidates(trajectories, bucket_flat_angle=bucket_flat_angle)
     segments = find_segment_candidate_triples(candidates)
 
     records: list[dict] = []
+    next_record_index = 0
 
-    for segment_idx, (dig_candidate_pos, dump_candidate_pos, reset_candidate_pos) in enumerate(segments):
-        dig_event_frame = candidates[dig_candidate_pos][0]
-        dump_event_frame = candidates[dump_candidate_pos][0]
-        reset_event_frame = candidates[reset_candidate_pos][0]
+    for parent_cycle_index_in_file, (dig_candidate_pos, dump_candidate_pos, reset_candidate_pos) in enumerate(segments):
+        dig_event_frame = int(candidates[dig_candidate_pos][0])
+        dump_event_frame = int(candidates[dump_candidate_pos][0])
+        reset_event_frame = int(candidates[reset_candidate_pos][0])
 
         if mirror_original_indexing:
-            dig_goal_idx = dig_candidate_pos
-            dump_goal_idx = dump_candidate_pos
-            reset_goal_idx = reset_candidate_pos
+            dig_goal_idx = int(dig_candidate_pos)
+            dump_goal_idx = int(dump_candidate_pos)
+            reset_goal_idx = int(reset_candidate_pos)
 
-            start_idx = max(0, dig_candidate_pos - lead_frames_before_dig)
-            seq_end_idx = int(np.clip(reset_candidate_pos + 1 - close_frames_before_reset, 0, len(trajectories)))
+            dig_swing_start_idx = max(0, int(dig_candidate_pos) - lead_frames_before_dig)
+            dig_swing_end_idx = int(np.clip(int(dump_candidate_pos) + 1, 0, len(trajectories)))
+            dump_return_start_idx = int(np.clip(int(dump_candidate_pos), 0, len(trajectories)))
+            dump_return_end_idx = int(np.clip(int(reset_candidate_pos) + 1 - close_frames_before_reset, 0, len(trajectories)))
         else:
             dig_goal_idx = dig_event_frame
             dump_goal_idx = dump_event_frame
             reset_goal_idx = reset_event_frame
 
-            start_idx = max(0, dig_event_frame - lead_frames_before_dig)
-            seq_end_idx = int(np.clip(reset_event_frame + 1 - close_frames_before_reset, 0, len(trajectories)))
+            dig_swing_start_idx = max(0, dig_event_frame - lead_frames_before_dig)
+            dig_swing_end_idx = int(np.clip(dump_event_frame + 1, 0, len(trajectories)))
+            dump_return_start_idx = int(np.clip(dump_event_frame, 0, len(trajectories)))
+            dump_return_end_idx = int(np.clip(reset_event_frame + 1 - close_frames_before_reset, 0, len(trajectories)))
 
-        segment_goal = np.asarray(
+        full_cycle_goal = np.asarray(
             [
                 keypoints_cylindrical[dig_goal_idx][KEYPOINT_GOAL_INDEX],
                 keypoints_cylindrical[dump_goal_idx][KEYPOINT_GOAL_INDEX],
@@ -142,27 +170,43 @@ def build_segments_detailed(
             ],
             dtype=np.float32,
         )
-        segment_traj = np.asarray(trajectories[start_idx:seq_end_idx], dtype=np.float32)
 
-        records.append(
-            {
-                "segment_index_in_file": segment_idx,
-                "dig_candidate_pos": int(dig_candidate_pos),
-                "dump_candidate_pos": int(dump_candidate_pos),
-                "reset_candidate_pos": int(reset_candidate_pos),
-                "dig_event_frame": int(dig_event_frame),
-                "dump_event_frame": int(dump_event_frame),
-                "reset_event_frame": int(reset_event_frame),
-                "goal_index_used_for_dig": int(dig_goal_idx),
-                "goal_index_used_for_dump": int(dump_goal_idx),
-                "goal_index_used_for_reset": int(reset_goal_idx),
-                "start_idx_used": int(start_idx),
-                "seq_end_idx_used": int(seq_end_idx),
-                "length": int(segment_traj.shape[0]),
-                "goal": segment_goal,
-                "trajectory": segment_traj,
-            }
-        )
+        stream_specs = [
+            (BEHAVIOR_STREAM_DIG_SWING, 0, dig_swing_start_idx, dig_swing_end_idx),
+            (BEHAVIOR_STREAM_DUMP_RETURN, 1, dump_return_start_idx, dump_return_end_idx),
+        ]
+
+        for behavior_stream, behavior_stream_index, start_idx, seq_end_idx in stream_specs:
+            if seq_end_idx <= start_idx:
+                continue
+
+            segment_traj = np.asarray(trajectories[start_idx:seq_end_idx], dtype=np.float32)
+
+            records.append(
+                {
+                    "segment_index_in_file": int(next_record_index),
+                    "parent_cycle_index_in_file": int(parent_cycle_index_in_file),
+                    "behavior_stream": behavior_stream,
+                    "behavior_stream_index": int(behavior_stream_index),
+                    "dig_candidate_pos": int(dig_candidate_pos),
+                    "dump_candidate_pos": int(dump_candidate_pos),
+                    "reset_candidate_pos": int(reset_candidate_pos),
+                    "dig_event_frame": int(dig_event_frame),
+                    "dump_event_frame": int(dump_event_frame),
+                    "reset_event_frame": int(reset_event_frame),
+                    "goal_index_used_for_dig": int(dig_goal_idx),
+                    "goal_index_used_for_dump": int(dump_goal_idx),
+                    "goal_index_used_for_reset": int(reset_goal_idx),
+                    "start_idx_used": int(start_idx),
+                    "seq_end_idx_used": int(seq_end_idx),
+                    "length": int(segment_traj.shape[0]),
+                    "goal": reduce_goal_for_behavior(full_cycle_goal, behavior_stream),
+                    "full_cycle_goal": full_cycle_goal,
+                    "goal_source_index": int(GOAL_SOURCE_INDEX_BY_BEHAVIOR[behavior_stream]),
+                    "trajectory": segment_traj,
+                }
+            )
+            next_record_index += 1
 
     return records
 
@@ -237,12 +281,15 @@ def compute_valid_rotation_offsets(
 
     Rotated fields:
       - traj[:, 0]     : cabin/turret rotation in joint-control space
-      - goal[:, 2]     : theta in [r, h, theta] goal space
+      - goal[-1]       : theta in the reduced goal representation [col0, col2]
     """
     if rotation_step <= 0:
         raise ValueError("rotation_step must be positive")
 
-    rot_values = np.concatenate([traj[:, 0], goal[:, 2]]).astype(np.float64)
+    goal = np.asarray(goal, dtype=np.float32).reshape(-1)
+    if goal.shape != (2,):
+        raise ValueError(f"Expected reduced goal shape (2,), got {goal.shape}")
+    rot_values = np.concatenate([traj[:, 0], goal[-1:]]).astype(np.float64)
     lower_bound = float(np.max(-rotation_limit - rot_values))
     upper_bound = float(np.min(rotation_limit - rot_values))
 
@@ -308,7 +355,7 @@ def iter_augmented_segment_records(
             augmented["num_rotations_for_base_segment"] = int(len(offsets))
 
             rotated_goal = goal.copy()
-            rotated_goal[:, 2] += np.float32(offset)
+            rotated_goal[-1] += np.float32(offset)
 
             rotated_traj = traj.copy()
             rotated_traj[:, 0] += np.float32(offset)
@@ -336,11 +383,13 @@ def build_segment_store(
 ) -> Path:
     """
     Build one HDF5 file containing:
-      - goals:               (S, 3, 3)
+      - goals:               (S, 2) reduced per-stream goals [col0, col2]
       - trajectories:        (S, n_max, 4)
       - lengths:             (S,)
-      - rotation_offsets:    (S,)
-      - base_segment_indices:(S,)
+      - rotation_offsets:     (S,)
+      - base_segment_indices: (S,)
+      - behavior_stream_indices: (S,)
+      - behavior_stream_labels:  (S,) fixed-width ASCII labels
 
     The builder pads each trajectory to n_max rows. If a produced trajectory is longer
     than n_max, it raises ValueError instead of silently truncating.
@@ -356,6 +405,8 @@ def build_segment_store(
     trajs_list: list[np.ndarray] = []
     rotation_offsets_list: list[float] = []
     base_segment_indices_list: list[int] = []
+    behavior_stream_indices_list: list[int] = []
+    behavior_stream_labels_list: list[bytes] = []
     included_paths: list[str] = []
     num_base_segments = 0
 
@@ -385,6 +436,8 @@ def build_segment_store(
         trajs_list.append(traj)
         rotation_offsets_list.append(float(record["rotation_offset"]))
         base_segment_indices_list.append(int(record["global_base_segment_index"]))
+        behavior_stream_indices_list.append(int(record["behavior_stream_index"]))
+        behavior_stream_labels_list.append(str(record["behavior_stream"]).encode("utf-8"))
         num_base_segments = max(num_base_segments, int(record["global_base_segment_index"]) + 1)
 
     if not goals_list:
@@ -393,11 +446,13 @@ def build_segment_store(
     num_segments = len(goals_list)
     num_source_files = len(included_paths)
 
-    goals = np.stack(goals_list, axis=0).astype(np.float32)  # (S, 3, 3)
+    goals = np.stack(goals_list, axis=0).astype(np.float32)  # (S, 2)
     trajectories = np.zeros((num_segments, n_max, 4), dtype=np.float32)
     lengths = np.zeros((num_segments,), dtype=np.int64)
     rotation_offsets = np.asarray(rotation_offsets_list, dtype=np.float32)
     base_segment_indices = np.asarray(base_segment_indices_list, dtype=np.int64)
+    behavior_stream_indices = np.asarray(behavior_stream_indices_list, dtype=np.int64)
+    behavior_stream_labels = np.asarray(behavior_stream_labels_list, dtype="S16")
 
     for i, traj in enumerate(trajs_list):
         n = traj.shape[0]
@@ -410,6 +465,8 @@ def build_segment_store(
         f.create_dataset("lengths", data=lengths)
         f.create_dataset("rotation_offsets", data=rotation_offsets)
         f.create_dataset("base_segment_indices", data=base_segment_indices)
+        f.create_dataset("behavior_stream_indices", data=behavior_stream_indices)
+        f.create_dataset("behavior_stream_labels", data=behavior_stream_labels)
 
         f.attrs["num_source_files"] = num_source_files
         f.attrs["num_base_segments"] = num_base_segments
@@ -418,6 +475,7 @@ def build_segment_store(
         f.attrs["rotation_limit"] = float(rotation_limit)
         f.attrs["rotation_step"] = float(rotation_step)
         f.attrs["mirror_original_indexing"] = bool(mirror_original_indexing)
+        f.attrs["behavior_stream_choices"] = np.asarray(BEHAVIOR_STREAMS, dtype="S16")
 
     manifest_path.write_text("\n".join(included_paths))
     return output_path
@@ -457,6 +515,9 @@ def write_segment_csv_exports(
         "global_augmented_segment_index",
         "global_base_segment_index",
         "segment_index_in_file",
+        "parent_cycle_index_in_file",
+        "behavior_stream",
+        "behavior_stream_index",
         "source_npz_path",
         "rotation_offset",
         "num_rotations_for_base_segment",
@@ -475,15 +536,9 @@ def write_segment_csv_exports(
         "segment_length",
         "frame_offset_in_segment",
         "absolute_frame_index_if_mirrored",
-        "dig_goal_r",
-        "dig_goal_h",
-        "dig_goal_theta",
-        "dump_goal_r",
-        "dump_goal_h",
-        "dump_goal_theta",
-        "reset_goal_r",
-        "reset_goal_h",
-        "reset_goal_theta",
+        "goal_source_index",
+        "goal_col0",
+        "goal_col2",
         "joint_control_0",
         "joint_control_1",
         "joint_control_2",
@@ -494,6 +549,9 @@ def write_segment_csv_exports(
         "global_augmented_segment_index",
         "global_base_segment_index",
         "segment_index_in_file",
+        "parent_cycle_index_in_file",
+        "behavior_stream",
+        "behavior_stream_index",
         "source_npz_path",
         "rotation_offset",
         "num_rotations_for_base_segment",
@@ -510,15 +568,9 @@ def write_segment_csv_exports(
         "start_idx_used",
         "seq_end_idx_used",
         "segment_length",
-        "dig_goal_r",
-        "dig_goal_h",
-        "dig_goal_theta",
-        "dump_goal_r",
-        "dump_goal_h",
-        "dump_goal_theta",
-        "reset_goal_r",
-        "reset_goal_h",
-        "reset_goal_theta",
+        "goal_source_index",
+        "goal_col0",
+        "goal_col2",
     ]
 
     flat_csv_paths: list[Path] = []
@@ -569,6 +621,9 @@ def write_segment_csv_exports(
                         record["global_augmented_segment_index"],
                         record["global_base_segment_index"],
                         record["segment_index_in_file"],
+                        record["parent_cycle_index_in_file"],
+                        record["behavior_stream"],
+                        record["behavior_stream_index"],
                         source_npz_path,
                         record["rotation_offset"],
                         record["num_rotations_for_base_segment"],
@@ -585,15 +640,9 @@ def write_segment_csv_exports(
                         record["start_idx_used"],
                         record["seq_end_idx_used"],
                         record["length"],
-                        float(goal[0, 0]),
-                        float(goal[0, 1]),
-                        float(goal[0, 2]),
-                        float(goal[1, 0]),
-                        float(goal[1, 1]),
-                        float(goal[1, 2]),
-                        float(goal[2, 0]),
-                        float(goal[2, 1]),
-                        float(goal[2, 2]),
+                        record["goal_source_index"],
+                        float(goal[0]),
+                        float(goal[1]),
                     ]
                 )
 
@@ -611,6 +660,9 @@ def write_segment_csv_exports(
                             record["global_augmented_segment_index"],
                             record["global_base_segment_index"],
                             record["segment_index_in_file"],
+                            record["parent_cycle_index_in_file"],
+                            record["behavior_stream"],
+                            record["behavior_stream_index"],
                             source_npz_path,
                             record["rotation_offset"],
                             record["num_rotations_for_base_segment"],
@@ -629,15 +681,9 @@ def write_segment_csv_exports(
                             record["length"],
                             frame_offset,
                             absolute_frame_index_if_mirrored,
-                            float(goal[0, 0]),
-                            float(goal[0, 1]),
-                            float(goal[0, 2]),
-                            float(goal[1, 0]),
-                            float(goal[1, 1]),
-                            float(goal[1, 2]),
-                            float(goal[2, 0]),
-                            float(goal[2, 1]),
-                            float(goal[2, 2]),
+                            record["goal_source_index"],
+                            float(goal[0]),
+                            float(goal[1]),
                             float(frame[0]),
                             float(frame[1]),
                             float(frame[2]),
@@ -666,8 +712,8 @@ def main() -> None:
 
     output_file = build_segment_store(
         seq_data_path="./seq_data/",
-        output_path=training_dir / "new_data_form_v2.h5",
-        manifest_path=training_dir / "new_data_form_v2_manifest.txt",
+        output_path=training_dir / "goal_reduce.h5",
+        manifest_path=training_dir / "goal_reduce_manifest.txt",
         n_max=400,
         lead_frames_before_dig=20,
         close_frames_before_reset=0,
@@ -677,17 +723,17 @@ def main() -> None:
         rotation_step=ROTATION_STEP,
     )
 
-    exports = write_segment_csv_exports(
-        seq_data_path="./seq_data/",
-        output_dir=training_dir,
-        output_prefix="new_data_form",
-        lead_frames_before_dig=20,
-        close_frames_before_reset=0,
-        bucket_flat_angle=1.1,
-        mirror_original_indexing=True,
-        rotation_limit=ROTATION_LIMIT,
-        rotation_step=ROTATION_STEP,
-    )
+    # exports = write_segment_csv_exports(
+    #     seq_data_path="./seq_data/",
+    #     output_dir=training_dir,
+    #     output_prefix="new_data_form",
+    #     lead_frames_before_dig=20,
+    #     close_frames_before_reset=0,
+    #     bucket_flat_angle=1.1,
+    #     mirror_original_indexing=True,
+    #     rotation_limit=ROTATION_LIMIT,
+    #     rotation_step=ROTATION_STEP,
+    # )
 
 
 if __name__ == "__main__":
